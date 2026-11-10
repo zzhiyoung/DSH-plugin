@@ -57,6 +57,7 @@ test('the desktop package is launched through --serve so ACP reaches stdio', asy
   assert.equal(planned.command, 'node.exe')
   assert.deepEqual(planned.args, [cli, '--serve', '--acp', '--acp-transport', 'stdio', '--port', '0'])
   assert.deepEqual(planned.env, ['CODEBUDDY_FORCE_LITE_WB_BUNDLE=1'])
+  assert.equal(planned.auth, 'internal')
 })
 
 test('a standalone CLI keeps the plain ACP entry and no forced bundle', async (t) => {
@@ -82,6 +83,20 @@ test('a bare command on PATH is launched directly', () => {
 
   assert.equal(planned.command, 'codebuddy')
   assert.deepEqual(planned.args, ['--acp', '--acp-transport', 'stdio'])
+  assert.equal(planned.auth, 'internal')
+})
+
+test('DSH_ACP_WORKBUDDY_AUTH overrides the ACP login method', async (t) => {
+  const cli = await layout(t, ['codebuddy-lite-wb.mjs'])
+  const previous = process.env.DSH_ACP_WORKBUDDY_AUTH
+  process.env.DSH_ACP_WORKBUDDY_AUTH = 'external'
+  try {
+    assert.equal(entry.planWorkBuddy(row(), cli).auth, 'external')
+    assert.equal(entry.planWorkBuddy(row({ auth: 'selfhosted' }), cli).auth, 'selfhosted')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_ACP_WORKBUDDY_AUTH
+    else process.env.DSH_ACP_WORKBUDDY_AUTH = previous
+  }
 })
 
 test('operator arguments are left alone and a missing CLI plans nothing', async (t) => {

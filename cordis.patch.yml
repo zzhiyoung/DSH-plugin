@@ -15,4 +15,5 @@
           - id: workbuddy
             title: WorkBuddy
             command: !!js process.env.DSH_ACP_NODE || 'node.exe'
+            auth: internal
             env: [CODEBUDDY_AUTH_TOKEN, CODEBUDDY_API_KEY, CODEBUDDY_CONFIG_DIR]

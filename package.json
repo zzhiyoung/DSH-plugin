@@ -1,6 +1,6 @@
 {
   "name": "dsh-acp-agent-hub",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Codex, Qoder, WorkBuddy and other ACP agents as model providers in DeepSeek Harness (DSH)",
   "type": "module",
   "main": "index.js",

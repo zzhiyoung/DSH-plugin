@@ -9,7 +9,7 @@ export class RequestError extends Error {
 
 export const methods = {
   client: { session: { update: 'session/update', requestPermission: 'session/request_permission' } },
-  agent: { initialize: 'initialize', session: { new: 'session/new', prompt: 'session/prompt' } },
+  agent: { initialize: 'initialize', authenticate: 'authenticate', session: { new: 'session/new', prompt: 'session/prompt' } },
 }
 
 export function client() {

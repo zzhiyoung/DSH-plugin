@@ -44,7 +44,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 - **Qoder**：使用 Qoder CLI 的登录态：`& "$env:USERPROFILE\.qoder\bin\qodercli\qodercli.exe" login`。
 - **WorkBuddy**：使用 WorkBuddy 桌面版自带的 CLI（`<WorkBuddy 安装目录>\resources\app.asar.unpacked\cli\bin\codebuddy`）。插件会先查 `ProgramFiles`、`ProgramFiles(x86)`、`%LOCALAPPDATA%\Programs`，再查卸载注册表里记录的安装路径（装在 D 盘这类非系统盘时靠这一步），也可以用 `DSH_ACP_WORKBUDDY` 指向启动脚本或可执行文件。实测（WorkBuddy 37.10.3-43，CLI 2.165.0）有两点需要注意：
   1. 桌面版只带 `codebuddy-lite-wb` 精简 bundle，直接 `--acp` 会报 `Cannot find module '../dist/codebuddy'`。插件检测到这种布局时自动改用 `--serve --acp --acp-transport stdio --port 0`，并注入 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`；完整 CLI（带 `dist/codebuddy-headless.js`）仍走普通 `--acp`。
-  2. CLI 不复用桌面版的登录态：未登录时 ACP 握手和 `session/new` 正常，但 `session/prompt` 返回 `refusal`。请先在 CLI 侧完成登录，或通过 `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_API_KEY` 提供凭据；插件把这两个变量列入 `env` 透传名单。
+  2. CLI 不复用桌面版的登录态，且登录态只在单次进程内有效：不登录时 ACP 握手和 `session/new` 正常，但 `session/prompt` 返回 `refusal`。插件会在握手后自动调用 ACP `authenticate`（WorkBuddy 行默认 `internal`，即微信登录）再建会话，因此通常无需手动登录；需要改用其他方式时设置 `DSH_ACP_WORKBUDDY_AUTH`，或在该行写 `auth: external` / `iOA` / `selfhosted`。
 
 ## 配置
 
@@ -68,6 +68,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
           - id: workbuddy
             title: WorkBuddy
             command: !!js process.env.DSH_ACP_NODE || 'node.exe'
+            auth: internal
             env: [CODEBUDDY_AUTH_TOKEN, CODEBUDDY_API_KEY, CODEBUDDY_CONFIG_DIR]
 ```
 
@@ -77,6 +78,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 | `agents[].command` | — | 可执行文件；`codex` 行留空 `args` 时插件会自动注入内置 ACP 适配器，`workbuddy` 行留空 `args` 时自动探测 CLI 并补全启动参数 |
 | `agents[].args` | `[]` | 启动参数；留空才启用内置补全，写入后按原样使用 |
 | `agents[].env` | `[]` | 环境变量：写 `NAME` 从 DSH 进程透传，写 `NAME=VALUE` 固定为该值 |
+| `agents[].auth` | — | ACP 登录方式 id；设置后连接握手完成即调用 `authenticate` 再建会话 |
 | `execution` | `released` | `released` 走 `llm/stream`；`driver` 提供 `agentTurnDriver`，允许桥接工具 |
 | `tools` | `[]` | 允许桥接给智能体的 DSH 工具（`read`、`skill`）；仅 `driver` 模式可用 |
 | `showThoughts` | `true` | 是否把 ACP 思考过程显示为 DSH 思考块 |
@@ -97,6 +99,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 | `CODEX_PATH` | 指定 `codex.exe` 完整路径，优先于自动检测 |
 | `DSH_ACP_QODER` | 自定义 `qodercli.exe` 完整路径 |
 | `DSH_ACP_WORKBUDDY` | 指定 WorkBuddy `codebuddy` 启动脚本或可执行文件，优先于自动检测 |
+| `DSH_ACP_WORKBUDDY_AUTH` | WorkBuddy 的 ACP 登录方式，默认 `internal`（微信登录） |
 | `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_API_KEY` | 透传给 WorkBuddy CLI 的凭据，用于 CLI 未登录时 |
 | `CODEBUDDY_CONFIG_DIR` | WorkBuddy CLI 的配置与登录态目录，默认 `%USERPROFILE%\.codebuddy` |
 
@@ -108,8 +111,8 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 - 附件（图片/文件）尚未接入，当前只接受文字输入。
 - `released` 模式下智能体拿不到 DSH 工具；需要工具桥接请用 `driver` 模式，并确认智能体支持 HTTP MCP。
 - 外部 CLI 使用自己的权限配置；插件会拒绝经 ACP 发起的原生工具审批。
-- WorkBuddy 桌面版的精简 bundle 需要 `--serve` 才能把 ACP 开在 stdio 上，因此每条连接还会在 `127.0.0.1` 的随机端口起一个带密码的本地 HTTP 服务；连接回收时随之退出。
-- WorkBuddy CLI 的登录态与桌面版相互独立，未登录时回复会以 `refusal` 结束。
+- WorkBuddy 桌面版的精简 bundle 需要 `--serve` 才能把 ACP 开在 stdio 上，因此每条连接还会在 `127.0.0.1` 的随机端口起一个带密码的本地 HTTP 服务，并把启动横幅写到 stdout；ACP 客户端会忽略这些非 JSON 行。连接回收时服务随之退出。
+- WorkBuddy CLI 的登录态只在单次进程内有效，插件每次新建连接都会重新 `authenticate`；这一步通常是静默的，但首次可能需要几百毫秒。
 
 ## 开发
 
@@ -167,6 +170,6 @@ MIT。内置的 `vendor/codex-acp` 来自 [@agentclientprotocol/codex-acp](https
 
 Install by pointing DSH's plugin page at this directory (or a `npm run pack:tgz` archive). Configure agents in the plugin's `cordis.patch.yml` row. `released` execution uses the public `llm/stream` waterfall; `driver` execution can additionally bridge DSH tools through a loopback HTTP MCP gateway.
 
-The WorkBuddy row auto-detects the CLI shipped with the desktop app. That package only contains the lite bundle, so the plugin launches it with `--serve --acp --acp-transport stdio --port 0` and `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`; without a CLI login the handshake succeeds but prompts end in `refusal`.
+The WorkBuddy row auto-detects the CLI shipped with the desktop app. That package only contains the lite bundle, so the plugin launches it with `--serve --acp --acp-transport stdio --port 0` and `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`, then calls ACP `authenticate` (`internal` by default) before creating the session, because the CLI's login state is per-process.
 
 Limitations: Windows only, root conversations only, text-only input for now, and the ACP agent manages its own credentials and permissions. Run `npm test` for the unit suite; it needs no Harness installation.

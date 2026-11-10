@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+### 新增
+
+- ACP `authenticate` 支持：智能体行新增 `auth` 字段（登录方式 id），连接握手后先登录再建会话。WorkBuddy 行默认用 `internal`（微信登录）；
+  WorkBuddy/CodeBuddy CLI 的登录态只在进程内有效，不登录时 `session/prompt` 会以 `refusal` 结束。
+- `DSH_ACP_WORKBUDDY_AUTH` 环境变量，用于覆盖 WorkBuddy 的登录方式（`internal`、`external`、`iOA`、`selfhosted`）。
+
 ## 0.3.0
 
 ### 新增

@@ -25,7 +25,8 @@ const Config = z.object({
 		title: z.string().required(),
 		command: z.string().required(),
 		args: z.array(z.string()).default([]),
-		env: z.array(z.string()).default([])
+		env: z.array(z.string()).default([]),
+		auth: z.string()
 	})).required(),
 	execution: z.union([z.const("driver"), z.const("released")]).default("driver"),
 	tools: z.array(z.union([z.const("read"), z.const("skill")])).default([]),

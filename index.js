@@ -104,9 +104,11 @@ export function planWorkBuddy(agent, cli = locateWorkBuddy()) {
   const env = desktopLayout && !agent.env.some((entry) => entry.split('=')[0] === 'CODEBUDDY_FORCE_LITE_WB_BUNDLE')
     ? [...agent.env, 'CODEBUDDY_FORCE_LITE_WB_BUNDLE=1']
     : agent.env
+  const override = process.env.DSH_ACP_WORKBUDDY_AUTH?.trim()
+  const auth = agent.auth ?? (override === undefined || override === '' ? 'internal' : override)
   return /\.(?:exe|cmd|bat)$/i.test(cli) || !hasDirectory
-    ? { ...agent, command: cli, args, env }
-    : { ...agent, args: [cli, ...args], env }
+    ? { ...agent, command: cli, args, env, auth }
+    : { ...agent, args: [cli, ...args], env, auth }
 }
 
 /**

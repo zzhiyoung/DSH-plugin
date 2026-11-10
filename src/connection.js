@@ -41,6 +41,7 @@ export class AcpConnection {
 	mcpName;
 	model;
 	initialModel;
+	auth;
 	promptSignal;
 	pendingMcpCalls = /* @__PURE__ */ new Set();
 	output;
@@ -52,6 +53,7 @@ export class AcpConnection {
 	constructor(subprocess, command, cwd, cancelGraceMs, mcpTools) {
 		this.cancelGraceMs = cancelGraceMs;
 		this.mcpTools = mcpTools;
+		this.auth = command.auth;
 		const env = commandEnvironment(command.env);
 		this.child = subprocess.spawn({
 			argv: [command.command, ...command.args],
@@ -151,6 +153,15 @@ export class AcpConnection {
 				}
 			}), signal);
 			if (result.protocolVersion !== PROTOCOL_VERSION) throw new Error("Unsupported ACP protocol version.");
+			if (this.auth !== void 0) {
+				stage = "authenticate";
+				try {
+					await until(() => agent.request(methods.agent.authenticate, { methodId: this.auth }), signal);
+				} catch (authError) {
+					if (authError instanceof RequestError) throw new Error(`ACP authentication with method ${this.auth} failed with protocol code ${authError.code}. Sign in with the agent CLI.`);
+					throw authError;
+				}
+			}
 			if (mcp !== void 0 && !result.agentCapabilities?.mcpCapabilities?.http) throw new Error("This ACP agent does not advertise HTTP MCP. Remove the DSH tool allowlist or use an HTTP-capable agent.");
 			stage = "session/new";
 			const session = await until(() => agent.request(methods.agent.session.new, {
