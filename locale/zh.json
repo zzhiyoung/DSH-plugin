@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "ACP 智能体接入",
-    "description": "把 Codex、Qoder 等 ACP 智能体接入 DSH，作为可选模型对话。"
+    "title": "ACP 智能体中枢",
+    "description": "把 Codex、Qoder、WorkBuddy 等 ACP 智能体接入 DSH，作为模型提供方使用。"
   }
 }

@@ -1,7 +1,7 @@
 {
   "name": "dsh-acp-agent-hub",
-  "version": "0.2.0",
-  "description": "Codex, Qoder and other ACP agents as model providers in DeepSeek Harness (DSH)",
+  "version": "0.3.0",
+  "description": "Codex, Qoder, WorkBuddy and other ACP agents as model providers in DeepSeek Harness (DSH)",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -26,20 +26,24 @@
     "acp",
     "agent-client-protocol",
     "codex",
-    "qoder"
+    "qoder",
+    "workbuddy",
+    "codebuddy"
   ],
   "engines": {
     "dsh": "0.2.2-rc.1"
   },
   "scripts": {
-    "check": "node --check index.js && node --check codex-desktop.mjs && node --check src/index.js && node --check src/connection.js && node --check src/context.js && node --check src/gateway.js && node --check src/released.js && node --check src/stream-blocks.js",
+    "check": "node --check index.js && node --check codex-desktop.mjs && node --check scripts/probe-acp.mjs && node --check src/index.js && node --check src/connection.js && node --check src/context.js && node --check src/gateway.js && node --check src/released.js && node --check src/stream-blocks.js",
     "test": "node --test \"test/*.test.js\"",
-    "pack:tgz": "npm pack"
+    "pack:tgz": "npm pack",
+    "probe": "node scripts/probe-acp.mjs"
   },
   "files": [
     "index.js",
     "codex-desktop.mjs",
     "cordis.patch.yml",
+    "scripts/*.mjs",
     "src/*.js",
     "locale/*.json",
     "icon.svg",

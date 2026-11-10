@@ -17,6 +17,21 @@ async function until(start, signal) {
 function modelConfig(options) {
 	return options?.find((option) => option.type === "select" && option.category === "model") ?? options?.find((option) => option.type === "select" && option.category == null && option.id === "model");
 }
+/**
+* Expand configured environment entries for one child process.
+* A bare name passes the DSH host value through; `NAME=VALUE` pins a literal.
+* @param entries - environment names and assignments from the agent row.
+* @returns the environment object handed to the subprocess.
+*/
+export function commandEnvironment(entries) {
+	const environment = {};
+	for (const entry of entries) {
+		const at = entry.indexOf("=");
+		if (at < 0) environment[entry] = process.env[entry];
+		else environment[entry.slice(0, at)] = entry.slice(at + 1);
+	}
+	return environment;
+}
 /** Live connection and one ACP Session. Its owner retires it after any uncertain prompt. */
 export class AcpConnection {
 	cancelGraceMs;
@@ -37,7 +52,7 @@ export class AcpConnection {
 	constructor(subprocess, command, cwd, cancelGraceMs, mcpTools) {
 		this.cancelGraceMs = cancelGraceMs;
 		this.mcpTools = mcpTools;
-		const env = Object.fromEntries(command.env.map((name) => [name, process.env[name]]));
+		const env = commandEnvironment(command.env);
 		this.child = subprocess.spawn({
 			argv: [command.command, ...command.args],
 			cwd,

@@ -12,3 +12,7 @@
             title: Qoder
             command: !!js process.env.DSH_ACP_QODER || process.env.USERPROFILE + '/.qoder/bin/qodercli/qodercli.exe'
             args: [--acp]
+          - id: workbuddy
+            title: WorkBuddy
+            command: !!js process.env.DSH_ACP_NODE || 'node.exe'
+            env: [CODEBUDDY_AUTH_TOKEN, CODEBUDDY_API_KEY, CODEBUDDY_CONFIG_DIR]

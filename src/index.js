@@ -124,7 +124,7 @@ async function close(binding) {
 */
 function apply(ctx, config) {
 	const byId = new Map(config.agents.map((agent) => [agent.id, agent]));
-	if (byId.size === 0 || byId.size !== config.agents.length || config.agents.some((agent) => !/^[a-z0-9][a-z0-9_-]*$/.test(agent.id) || agent.command.trim() === "" || agent.title.trim() === "" || agent.env.some((key) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)))) throw new Error("ACP Hub requires unique agent ids, nonempty commands and titles, and valid environment variable names.");
+	if (byId.size === 0 || byId.size !== config.agents.length || config.agents.some((agent) => !/^[a-z0-9][a-z0-9_-]*$/.test(agent.id) || agent.command.trim() === "" || agent.title.trim() === "" || agent.env.some((entry) => !/^[A-Za-z_][A-Za-z0-9_]*(?:=[\s\S]*)?$/.test(entry)))) throw new Error("ACP Hub requires unique agent ids, nonempty commands and titles, and environment entries that are variable names or NAME=VALUE pairs.");
 	const providers = new Map(config.agents.map((agent) => [PROVIDER_PREFIX + agent.id, agent]));
 	if (config.execution === "released" && config.tools.length > 0) throw new Error("The released DSH integration does not support the ACP tool gateway. Set tools to an empty list.");
 	const allow = new Set(config.tools);

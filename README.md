@@ -1,6 +1,6 @@
 # DSH ACP Agent Hub
 
-把 [Codex](https://github.com/agentclientprotocol/codex-acp)、[Qoder](https://docs.qoder.com/cli/acp) 等支持 **ACP（Agent Client Protocol）** 的智能体接入 DeepSeek Harness（DSH），在 DSH 的模型菜单里直接选用它们对话。
+把 [Codex](https://github.com/agentclientprotocol/codex-acp)、[Qoder](https://docs.qoder.com/cli/acp)、[WorkBuddy](https://www.codebuddy.cn/) 等支持 **ACP（Agent Client Protocol）** 的智能体接入 DeepSeek Harness（DSH），在 DSH 的模型菜单里直接选用它们对话。
 
 [![CI](https://github.com/zzhiyoung/DSH-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/zzhiyoung/DSH-plugin/actions/workflows/ci.yml)
 
@@ -8,7 +8,7 @@
 
 ## 这个插件做什么
 
-DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 ACP 智能体注册一个提供方（`acp-codex`、`acp-qoder` …），并在用户选择它时：
+DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 ACP 智能体注册一个提供方（`acp-codex`、`acp-qoder`、`acp-workbuddy` …），并在用户选择它时：
 
 1. 用 DSH 托管的子进程启动对应 CLI，按 ACP v1 握手、开一个新会话；
 2. 把 DSH 会话里可见的文字历史与本轮请求打包成一条提示发给智能体；
@@ -25,6 +25,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 - 两种接入方式：
   - `released`（默认）：走公开的 `llm/stream` 瀑布流，适配官方桌面版；
   - `driver`：提供 `agentTurnDriver` 服务，可把 DSH 工具经本地 HTTP MCP 桥接给智能体（需该智能体支持 HTTP MCP）。
+- WorkBuddy 行会自动探测桌面版随附的 `codebuddy` CLI，并适配它只带精简 bundle 的启动方式。
 
 ## 安装
 
@@ -33,7 +34,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 1. 在 DSH 桌面版打开「插件」→「添加插件」。
 2. 「包名或地址」填本仓库目录的完整路径（例如 `D:\coding\DSH-plugin`），或先 `npm run pack:tgz` 生成 `.tgz` 后填该文件的完整路径。
 3. 安装成功后点「立即启用」，按提示重启 DSH。
-4. 打开工作区和会话，在输入区右下角的模型菜单里选择 Codex / Qoder 下的具体模型。
+4. 打开工作区和会话，在输入区右下角的模型菜单里选择 Codex / Qoder / WorkBuddy 下的具体模型。
 
 升级已有版本前，先在插件页卸载旧版。详细步骤见 [docs/安装说明.md](docs/安装说明.md)。
 
@@ -41,6 +42,9 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 
 - **Codex**：需要 Node.js（已用 24.x 验证）和已登录的 Codex。插件内含 ACP 适配器，优先检测 Codex Desktop CLI，也支持 `PATH` 里的 `codex`。没装可用 `npm.cmd install -g @openai/codex` 后 `codex login`。
 - **Qoder**：使用 Qoder CLI 的登录态：`& "$env:USERPROFILE\.qoder\bin\qodercli\qodercli.exe" login`。
+- **WorkBuddy**：使用 WorkBuddy 桌面版自带的 CLI（`<WorkBuddy 安装目录>\resources\app.asar.unpacked\cli\bin\codebuddy`）。插件会先查 `ProgramFiles`、`ProgramFiles(x86)`、`%LOCALAPPDATA%\Programs`，再查卸载注册表里记录的安装路径（装在 D 盘这类非系统盘时靠这一步），也可以用 `DSH_ACP_WORKBUDDY` 指向启动脚本或可执行文件。实测（WorkBuddy 37.10.3-43，CLI 2.165.0）有两点需要注意：
+  1. 桌面版只带 `codebuddy-lite-wb` 精简 bundle，直接 `--acp` 会报 `Cannot find module '../dist/codebuddy'`。插件检测到这种布局时自动改用 `--serve --acp --acp-transport stdio --port 0`，并注入 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`；完整 CLI（带 `dist/codebuddy-headless.js`）仍走普通 `--acp`。
+  2. CLI 不复用桌面版的登录态：未登录时 ACP 握手和 `session/new` 正常，但 `session/prompt` 返回 `refusal`。请先在 CLI 侧完成登录，或通过 `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_API_KEY` 提供凭据；插件把这两个变量列入 `env` 透传名单。
 
 ## 配置
 
@@ -61,14 +65,18 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
             title: Qoder
             command: !!js process.env.DSH_ACP_QODER || process.env.USERPROFILE + '/.qoder/bin/qodercli/qodercli.exe'
             args: [--acp]
+          - id: workbuddy
+            title: WorkBuddy
+            command: !!js process.env.DSH_ACP_NODE || 'node.exe'
+            env: [CODEBUDDY_AUTH_TOKEN, CODEBUDDY_API_KEY, CODEBUDDY_CONFIG_DIR]
 ```
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `agents` | — | 智能体列表，`id` 只能用小写字母、数字、`_`、`-`，`title` 显示在模型菜单 |
-| `agents[].command` | — | 可执行文件；`codex` 行留空 `args` 时插件会自动注入内置 ACP 适配器 |
-| `agents[].args` | `[]` | 启动参数 |
-| `agents[].env` | `[]` | 从 DSH 进程透传的环境变量名 |
+| `agents[].command` | — | 可执行文件；`codex` 行留空 `args` 时插件会自动注入内置 ACP 适配器，`workbuddy` 行留空 `args` 时自动探测 CLI 并补全启动参数 |
+| `agents[].args` | `[]` | 启动参数；留空才启用内置补全，写入后按原样使用 |
+| `agents[].env` | `[]` | 环境变量：写 `NAME` 从 DSH 进程透传，写 `NAME=VALUE` 固定为该值 |
 | `execution` | `released` | `released` 走 `llm/stream`；`driver` 提供 `agentTurnDriver`，允许桥接工具 |
 | `tools` | `[]` | 允许桥接给智能体的 DSH 工具（`read`、`skill`）；仅 `driver` 模式可用 |
 | `showThoughts` | `true` | 是否把 ACP 思考过程显示为 DSH 思考块 |
@@ -88,6 +96,9 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 | `DSH_ACP_CODEX_ENTRY` | 自定义 Codex ACP 适配器的 `dist/index.js` 完整路径；默认用插件内置的适配器 |
 | `CODEX_PATH` | 指定 `codex.exe` 完整路径，优先于自动检测 |
 | `DSH_ACP_QODER` | 自定义 `qodercli.exe` 完整路径 |
+| `DSH_ACP_WORKBUDDY` | 指定 WorkBuddy `codebuddy` 启动脚本或可执行文件，优先于自动检测 |
+| `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_API_KEY` | 透传给 WorkBuddy CLI 的凭据，用于 CLI 未登录时 |
+| `CODEBUDDY_CONFIG_DIR` | WorkBuddy CLI 的配置与登录态目录，默认 `%USERPROFILE%\.codebuddy` |
 
 ## 已知限制
 
@@ -97,27 +108,41 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 - 附件（图片/文件）尚未接入，当前只接受文字输入。
 - `released` 模式下智能体拿不到 DSH 工具；需要工具桥接请用 `driver` 模式，并确认智能体支持 HTTP MCP。
 - 外部 CLI 使用自己的权限配置；插件会拒绝经 ACP 发起的原生工具审批。
+- WorkBuddy 桌面版的精简 bundle 需要 `--serve` 才能把 ACP 开在 stdio 上，因此每条连接还会在 `127.0.0.1` 的随机端口起一个带密码的本地 HTTP 服务；连接回收时随之退出。
+- WorkBuddy CLI 的登录态与桌面版相互独立，未登录时回复会以 `refusal` 结束。
 
 ## 开发
 
 ```powershell
 node --check index.js        # 语法检查
+npm run check                # 检查入口与全部模块
 npm test                     # node:test 单元测试
 npm run pack:tgz             # 生成可安装的 .tgz
 ```
 
 在不能创建子进程的受限环境里，改用 `node --test --test-isolation=none "test/*.test.js"` 在单进程内跑同一套测试。
 
+需要确认某个智能体的 ACP 行为时，用探测脚本直接握手：
+
+```powershell
+node scripts/probe-acp.mjs --env CODEBUDDY_FORCE_LITE_WB_BUNDLE=1 -- `
+  node "D:\Program Files\WorkBuddy\resources\app.asar.unpacked\cli\bin\codebuddy" `
+  --serve --acp --acp-transport stdio --port 0
+```
+
+它会打印协议版本、模型目录、MCP 能力、登录方式，以及 `session/new` 是否成功。
+
 目录结构：
 
 ```
-index.js              插件入口：为 codex 行注入内置 ACP 适配器，再转交 apply
+index.js              插件入口：为 codex 注入内置 ACP 适配器、为 workbuddy 补全启动参数，再转交 apply
 src/index.js          注册模型目录、根轮驱动 / llm/stream 适配，管理连接生命周期
 src/connection.js     ACP v1 连接：子进程、握手、会话、提示、取消
 src/context.js        把 DSH 会话投影成发送给智能体的文本上下文
 src/gateway.js        本地 HTTP MCP 网关，把 DSH 工具暴露给智能体
 src/released.js       released 模式的 llm/stream 适配
 src/stream-blocks.js  把 ACP 正文/思考片段整理成 DSH 流式块
+scripts/probe-acp.mjs ACP 握手探测脚本
 test/                 单元测试与依赖桩（不需要安装 DSH 即可运行）
 vendor/codex-acp/     内置的 @agentclientprotocol/codex-acp 2.6.0（Apache-2.0）
 ```
@@ -138,8 +163,10 @@ MIT。内置的 `vendor/codex-acp` 来自 [@agentclientprotocol/codex-acp](https
 
 ## English
 
-**DSH ACP Agent Hub** registers Codex, Qoder and any other ACP-capable agent as model providers inside DeepSeek Harness (0.2.2-rc.1, Windows). Select the group in the model menu and the plugin spawns the agent CLI, negotiates ACP v1, sends the DSH conversation as a prompt, and streams the reply — including the agent's thinking blocks — back into the transcript.
+**DSH ACP Agent Hub** registers Codex, Qoder, WorkBuddy and any other ACP-capable agent as model providers inside DeepSeek Harness (0.2.2-rc.1, Windows). Select the group in the model menu and the plugin spawns the agent CLI, negotiates ACP v1, sends the DSH conversation as a prompt, and streams the reply — including the agent's thinking blocks — back into the transcript.
 
 Install by pointing DSH's plugin page at this directory (or a `npm run pack:tgz` archive). Configure agents in the plugin's `cordis.patch.yml` row. `released` execution uses the public `llm/stream` waterfall; `driver` execution can additionally bridge DSH tools through a loopback HTTP MCP gateway.
+
+The WorkBuddy row auto-detects the CLI shipped with the desktop app. That package only contains the lite bundle, so the plugin launches it with `--serve --acp --acp-transport stdio --port 0` and `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`; without a CLI login the handshake succeeds but prompts end in `refusal`.
 
 Limitations: Windows only, root conversations only, text-only input for now, and the ACP agent manages its own credentials and permissions. Run `npm test` for the unit suite; it needs no Harness installation.
