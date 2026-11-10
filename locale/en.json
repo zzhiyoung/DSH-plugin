@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ACP agent hub",
+    "description": "Run Codex, Qoder and other ACP agents as model providers in DSH."
+  }
+}

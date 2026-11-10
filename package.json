@@ -1,0 +1,68 @@
+{
+  "name": "dsh-acp-agent-hub",
+  "version": "0.2.0",
+  "description": "Codex, Qoder and other ACP agents as model providers in DeepSeek Harness (DSH)",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "license": "MIT",
+  "author": "zzhiyoung",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zzhiyoung/DSH-plugin.git"
+  },
+  "homepage": "https://github.com/zzhiyoung/DSH-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/zzhiyoung/DSH-plugin/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "acp",
+    "agent-client-protocol",
+    "codex",
+    "qoder"
+  ],
+  "engines": {
+    "dsh": "0.2.2-rc.1"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check codex-desktop.mjs && node --check src/index.js && node --check src/connection.js && node --check src/context.js && node --check src/gateway.js && node --check src/released.js && node --check src/stream-blocks.js",
+    "test": "node --test \"test/*.test.js\"",
+    "pack:tgz": "npm pack"
+  },
+  "files": [
+    "index.js",
+    "codex-desktop.mjs",
+    "cordis.patch.yml",
+    "src/*.js",
+    "locale/*.json",
+    "icon.svg",
+    "vendor/codex-acp/dist/index.js",
+    "vendor/codex-acp/LICENSE",
+    "vendor/codex-acp/package.json",
+    "vendor/codex-acp/README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@deepseek-ai/schemastery": "3.19.0",
+    "@modelcontextprotocol/sdk": "1.31.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml",
+      "platforms": [
+        "win32"
+      ]
+    }
+  }
+}

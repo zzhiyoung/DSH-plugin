@@ -1,0 +1,14 @@
+- insert:
+    - id: acp-agent-hub
+      name: dsh-acp-agent-hub
+      config:
+        execution: released
+        agents:
+          - id: codex
+            title: Codex
+            command: !!js process.env.DSH_ACP_NODE || 'node.exe'
+            env: [CODEX_PATH, CODEX_HOME]
+          - id: qoder
+            title: Qoder
+            command: !!js process.env.DSH_ACP_QODER || process.env.USERPROFILE + '/.qoder/bin/qodercli/qodercli.exe'
+            args: [--acp]
