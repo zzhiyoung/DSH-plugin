@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { register } from 'node:module'
 import { test } from 'node:test'
 
 register(new URL('./support/hooks.mjs', import.meta.url).href)
 
 const hub = await import('../src/index.js')
+const entry = await import('../index.js')
 
 function config(overrides = {}) {
   return {
@@ -108,4 +110,15 @@ test('rejects duplicate agent ids, malformed ids, and tools in released executio
     () => hub.apply(ctx, config({ tools: ['read'] })),
     /does not support the ACP tool gateway/,
   )
+})
+
+test('entry point ships the ACP adapter it injects into the Codex row', () => {
+  assert.ok(existsSync(new URL('../codex-desktop.mjs', import.meta.url)))
+  assert.ok(existsSync(new URL('../vendor/codex-acp/dist/index.js', import.meta.url)))
+
+  const { ctx, adapters, listeners } = background()
+  entry.apply(ctx, config())
+
+  assert.deepEqual(adapters[0].providers, ['acp-codex', 'acp-qoder'])
+  assert.equal(listeners.filter((listener) => listener.event === 'llm/stream').length, 1)
 })
