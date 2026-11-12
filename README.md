@@ -40,7 +40,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 
 ### 准备智能体
 
-- **Codex**：需要 Node.js（已用 24.x 验证）和已登录的 Codex。插件内含 ACP 适配器，优先检测 Codex Desktop CLI，也支持 `PATH` 里的 `codex`。没装可用 `npm.cmd install -g @openai/codex` 后 `codex login`。
+- **Codex**：需要 Node.js（已用 24.x 验证）和已登录的 Codex。推荐用官方 CLI：`npm.cmd install -g @openai/codex`，再 `codex login`。插件内含 ACP 适配器，会优先使用带 `codex-code-mode-host.exe` 的完整安装（全局 CLI → Codex Desktop 的版本目录），也支持 `PATH` 里的 `codex`。Codex 的 **Code Mode** 靠与 `codex.exe` 同目录的 `codex-code-mode-host.exe` 启动；只复制了 `codex.exe` 的目录（例如某些沙箱副本）能回文字，但一调用命令工具就报 `code-mode host executable not found`。
 - **Qoder**：使用 Qoder CLI 的登录态：`& "$env:USERPROFILE\.qoder\bin\qodercli\qodercli.exe" login`。
 - **WorkBuddy**：使用 WorkBuddy 桌面版自带的 CLI（`<WorkBuddy 安装目录>\resources\app.asar.unpacked\cli\bin\codebuddy`）。插件会先查 `ProgramFiles`、`ProgramFiles(x86)`、`%LOCALAPPDATA%\Programs`，再查卸载注册表里记录的安装路径（装在 D 盘这类非系统盘时靠这一步），也可以用 `DSH_ACP_WORKBUDDY` 指向启动脚本或可执行文件。实测（WorkBuddy 37.10.3-43，CLI 2.165.0）有两点需要注意：
   1. 桌面版只带 `codebuddy-lite-wb` 精简 bundle，直接 `--acp` 会报 `Cannot find module '../dist/codebuddy'`。插件检测到这种布局时自动改用 `--serve --acp --acp-transport stdio --port 0`，并注入 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`；完整 CLI（带 `dist/codebuddy-headless.js`）仍走普通 `--acp`。
@@ -96,7 +96,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 | --- | --- |
 | `DSH_ACP_NODE` | 自定义 `node.exe` 完整路径 |
 | `DSH_ACP_CODEX_ENTRY` | 自定义 Codex ACP 适配器的 `dist/index.js` 完整路径；默认用插件内置的适配器 |
-| `CODEX_PATH` | 指定 `codex.exe` 完整路径，优先于自动检测 |
+| `CODEX_PATH` | 指定 `codex.exe` 完整路径，优先于自动检测。目录里缺少 `codex-code-mode-host.exe` 时，插件会改用完整安装并记录一条说明 |
 | `DSH_ACP_QODER` | 自定义 `qodercli.exe` 完整路径 |
 | `DSH_ACP_WORKBUDDY` | 指定 WorkBuddy `codebuddy` 启动脚本或可执行文件，优先于自动检测 |
 | `DSH_ACP_WORKBUDDY_AUTH` | WorkBuddy 的 ACP 登录方式，默认 `internal`（微信登录） |
@@ -113,6 +113,21 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 - 外部 CLI 使用自己的权限配置；插件会拒绝经 ACP 发起的原生工具审批。
 - WorkBuddy 桌面版的精简 bundle 需要 `--serve` 才能把 ACP 开在 stdio 上，因此每条连接还会在 `127.0.0.1` 的随机端口起一个带密码的本地 HTTP 服务，并把启动横幅写到 stdout；ACP 客户端会忽略这些非 JSON 行。连接回收时服务随之退出。
 - WorkBuddy CLI 的登录态只在单次进程内有效，插件每次新建连接都会重新 `authenticate`；这一步通常是静默的，但首次可能需要几百毫秒。
+
+## 排错
+
+### Codex 只回文字，命令工具报 `code-mode host executable not found`
+
+Codex 的 Code Mode 依赖与 `codex.exe` 同目录的 `codex-code-mode-host.exe`。Codex Desktop 在 `%LOCALAPPDATA%\OpenAI\Codex\bin\<版本哈希>\` 下解包整套文件，而 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 这类沙箱副本只有主程序，`CODEX_PATH` 指到它就会出现「文字能回、命令跑不动」。0.4.0 起插件会检测并回退，日志里留一条 `[dsh-acp-agent-hub] CODEX_PATH points at ...`。
+
+要彻底改用官方 CLI：
+
+```powershell
+npm.cmd install -g @openai/codex
+[Environment]::SetEnvironmentVariable('CODEX_PATH', "$env:APPDATA\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe", 'User')
+```
+
+这条路径不含版本号，`npm update -g @openai/codex` 升级后仍然有效。改完从托盘完全退出 DSH 再启动，新开一个 Codex 会话让它执行一次 `git status --short`：命令有输出、日志里没有 code-mode 告警即为修好。
 
 ## 开发
 
@@ -141,6 +156,7 @@ node scripts/probe-acp.mjs --env CODEBUDDY_FORCE_LITE_WB_BUNDLE=1 -- `
 index.js              插件入口：为 codex 注入内置 ACP 适配器、为 workbuddy 补全启动参数，再转交 apply
 src/index.js          注册模型目录、根轮驱动 / llm/stream 适配，管理连接生命周期
 src/connection.js     ACP v1 连接：子进程、握手、会话、提示、取消
+src/codex-path.js     选择 Codex 可执行文件：校验 code-mode host，必要时回退到完整安装
 src/context.js        把 DSH 会话投影成发送给智能体的文本上下文
 src/gateway.js        本地 HTTP MCP 网关，把 DSH 工具暴露给智能体
 src/released.js       released 模式的 llm/stream 适配

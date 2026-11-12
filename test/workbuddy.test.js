@@ -103,7 +103,17 @@ test('operator arguments are left alone and a missing CLI plans nothing', async 
   const cli = await layout(t, ['codebuddy-lite-wb.mjs'])
 
   assert.equal(entry.planWorkBuddy(row({ args: ['--custom'] }), cli).args[0], '--custom')
-  assert.equal(entry.planWorkBuddy(row(), undefined), undefined)
+
+  // Probe the real detection path with an override that cannot exist, so the
+  // assertion does not depend on whether WorkBuddy is installed on this machine.
+  const previous = process.env.DSH_ACP_WORKBUDDY
+  process.env.DSH_ACP_WORKBUDDY = join(tmpdir(), 'dsh-missing-workbuddy', 'codebuddy.exe')
+  try {
+    assert.equal(entry.planWorkBuddy(row()), undefined)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_ACP_WORKBUDDY
+    else process.env.DSH_ACP_WORKBUDDY = previous
+  }
 })
 
 test('the entry point registers WorkBuddy when its CLI path is overridden', async (t) => {

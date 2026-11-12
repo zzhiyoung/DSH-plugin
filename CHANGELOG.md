@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+### 修复
+
+- Codex 能回文字但命令工具报 `failed to spawn code-mode host` / `code-mode host executable not found` 时，插件不再静默沿用不完整的 `CODEX_PATH`。新增 `src/codex-path.js`：只有 `codex.exe` 同目录存在 `codex-code-mode-host.exe` 的安装才算完整；显式 `CODEX_PATH` 缺少该文件时，改用完整的官方 CLI 或 Codex Desktop 安装，并在 stderr 写明替换前后的路径。
+- 自动检测优先选择带 code-mode host 的安装（先 `npm install -g @openai/codex` 的全局目录，再 `%LOCALAPPDATA%\OpenAI\Codex\bin` 下的版本目录），不再只按修改时间取最新版本。
+- WorkBuddy 的「找不到 CLI」用例改用不存在的覆盖路径，不再依赖本机是否安装了 WorkBuddy。
+
+### 变更
+
+- 版本号升至 0.4.0；README 与安装说明补充 OpenAI CLI 安装路径与这条故障的排查方式。
+
 ## 0.3.1
 
 ### 新增

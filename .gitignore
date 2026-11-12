@@ -5,5 +5,8 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
+# 本地工作记录，不进仓库
+.workbuddy/
+
 # 旧版交付物（只读属性 + 目录删除限制，无法在沙箱内移除）
 /安装说明.md
