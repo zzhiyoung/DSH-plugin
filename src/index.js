@@ -1,3 +1,5 @@
+import { DshTools, toolGuide } from './tool-bridge.js'
+import { permissionHandler, dshToolDecision } from './approval.js'
 import { mkdtemp, realpath, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -5,7 +7,7 @@ import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { AcpConnection } from './connection.js'
-import { projectContext } from './context.js'
+import { projectPrompt } from './context.js'
 import { Gateway } from './gateway.js'
 import { streamReleasedTurn } from './released.js'
 
@@ -26,12 +28,19 @@ const Config = z.object({
 		command: z.string().required(),
 		args: z.array(z.string()).default([]),
 		env: z.array(z.string()).default([]),
-		auth: z.string()
+		auth: z.string(),
+		permissionMode: z.string().description('外部 agent 的权限模式 ID；仅选择其实际声明支持的模式')
 	})).required(),
-	execution: z.union([z.const("driver"), z.const("released")]).default("driver"),
-	tools: z.array(z.union([z.const("read"), z.const("skill")])).default([]),
-	startupMs: z.natural().min(1).max(12e4).default(15e3),
-	promptMs: z.natural().min(1).max(36e5).default(6e5),
+	execution: z.union([z.const("driver"), z.const("released")]).default("released"),
+	toolSource: z.union([z.const('dsh'), z.const('external')]).default('dsh').volatile().description('工具来源：dsh 优先使用当前 DSH 工具、MCP 和技能；external 使用外部 CLI 工具'),
+	tools: z.array(z.string()).default([]).volatile().description('DSH 工具白名单；空列表表示当前会话可用的全部工具'),
+	toolApproval: z.union([z.const('rules'), z.const('ask')]).default('rules').volatile().description('DSH 工具按现有权限规则处理，或每次都询问'),
+	nativeApproval: z.union([z.const('dsh'), z.const('agent'), z.const('deny')]).default('dsh').volatile().description('原生工具：DSH 确认 / 跟随外部 agent 权限模式 / 拒绝 ACP 审批'),
+	permissionMode: z.string().default('').volatile().description('外部 agent 权限模式 ID；留空沿用当前模式；例如 Codex 的 agent 是 Auto review，不是全量放行'),
+	startupMs: z.natural().max(12e4).default(0),
+	// Accepted for existing installations; no prompt deadline is applied.
+	promptMs: z.natural().default(0),
+	maxImageBytes: z.natural().min(1024).max(64 * 1024 * 1024).default(20 * 1024 * 1024),
 	cancelGraceMs: z.natural().min(1).max(3e4).default(5e3),
 	idleMs: z.natural().min(1).max(36e5).default(9e5),
 	maxBindings: z.natural().min(1).max(100).default(8),
@@ -63,13 +72,13 @@ var Catalog = class extends LlmAdapter {
 			name: this.providers.get(provider)?.title ?? provider
 		};
 	}
-	resolveModel(provider, model, signal) {
+	async resolveModel(provider, model, signal) {
 		if (this.releasedContextWindow === void 0) return super.resolveModel(provider, model, signal);
 		return Promise.resolve({
 			provider,
 			id: model,
 			name: model,
-			inputModalities: ["text"],
+			inputModalities: (await this.listModels(provider)).find((row) => row.id === model)?.inputModalities ?? ["text"],
 			context: { contextWindow: this.releasedContextWindow }
 		});
 	}
@@ -84,12 +93,12 @@ var Catalog = class extends LlmAdapter {
 			name: `${harness.title} · Default model`,
 			inputModalities: ["text"]
 		};
-		const result = this.discover(harness).then((models) => [fallback, ...models.map((model) => ({
+		const result = this.discover(harness).then(({ models, imageInput }) => [{ ...fallback, inputModalities: imageInput ? ["text", "image"] : ["text"] }, ...models.map((model) => ({
 			id: MODEL_PREFIX + model.value,
 			provider,
 			name: `${harness.title} · ${model.name}`,
 			...model.description == null ? {} : { description: model.description },
-			inputModalities: ["text"]
+			inputModalities: imageInput ? ["text", "image"] : ["text"]
 		}))], (_error) => {
 			this.cache.delete(provider);
 			return [fallback];
@@ -123,12 +132,22 @@ async function close(binding) {
 * @param ctx - Cordis context owning the driver, catalog, and gateway policy.
 * @param config - local commands, tool allowlist, and resource limits.
 */
+const option = (value, fallback) => value?.get instanceof Function ? value.get() : value ?? fallback;
+export function configSnapshot(config) {
+	return { ...config,
+		toolSource: option(config.toolSource, config.tools?.length ? 'dsh' : 'external'),
+		tools: [...option(config.tools, [])],
+		toolApproval: option(config.toolApproval, 'rules'),
+		nativeApproval: option(config.nativeApproval, 'dsh'),
+		permissionMode: option(config.permissionMode, ''),
+	};
+}
 function apply(ctx, config) {
 	const byId = new Map(config.agents.map((agent) => [agent.id, agent]));
 	if (byId.size === 0 || byId.size !== config.agents.length || config.agents.some((agent) => !/^[a-z0-9][a-z0-9_-]*$/.test(agent.id) || agent.command.trim() === "" || agent.title.trim() === "" || agent.env.some((entry) => !/^[A-Za-z_][A-Za-z0-9_]*(?:=[\s\S]*)?$/.test(entry)))) throw new Error("ACP Hub requires unique agent ids, nonempty commands and titles, and environment entries that are variable names or NAME=VALUE pairs.");
 	const providers = new Map(config.agents.map((agent) => [PROVIDER_PREFIX + agent.id, agent]));
-	if (config.execution === "released" && config.tools.length > 0) throw new Error("The released DSH integration does not support the ACP tool gateway. Set tools to an empty list.");
-	const allow = new Set(config.tools);
+
+
 	const bindings = /* @__PURE__ */ new Map();
 	const retirements = /* @__PURE__ */ new Map();
 	const active = /* @__PURE__ */ new Set();
@@ -151,17 +170,15 @@ function apply(ctx, config) {
 		retireObserved(agent);
 	});
 	ctx.on("tools/pre-execute", async (execution, next) => {
-		const approve = gated.has(execution.rootCallId);
-		const decision = await next();
-		return approve && decision.kind === "allow" ? {
-			kind: "ask",
-			reason: "An external ACP agent requested this DSH tool."
-		} : decision;
+		return dshToolDecision(option(config.toolApproval, 'rules'), execution, await next(), gated);
 	}, { prepend: true });
 	const flush = async (input) => {
 		if (!await ctx.sessions.flush(input.agent.session)) throw new Error("ACP Hub requires an active DSH session persistence listener.");
 	};
+	const snapshot = () => configSnapshot(config);
 	const run = async (input) => {
+		const config = snapshot();
+		const allow = new Set(config.tools);
 		const { agent, selection, turn, step } = input;
 		const session = agent.session;
 		const legacy = selection.provider === LEGACY_PROVIDER;
@@ -171,8 +188,7 @@ function apply(ctx, config) {
 		if (model !== void 0 && (!selection.model.startsWith(MODEL_PREFIX) || model === "")) throw new Error("Choose a model from the ACP agent’s model list.");
 		const signal = AbortSignal.any([
 			input.signal,
-			shutdown.signal,
-			AbortSignal.timeout(config.promptMs)
+			shutdown.signal
 		]);
 		const originalCwd = session.header.cwd;
 		if (originalCwd === void 0 || !isAbsolute(originalCwd)) throw new Error("Select a DSH workspace before using an ACP agent.");
@@ -180,33 +196,42 @@ function apply(ctx, config) {
 		const info = await stat(cwd, { bigint: true });
 		if (!info.isDirectory()) throw new Error("The DSH workspace is not a directory.");
 		const directory = `${info.dev}:${info.ino}`;
-		const schemas = ctx.tools.schemas(agent, input.toolSet).filter((schema) => allow.has(schema.name));
-		const catalog = JSON.stringify(schemas);
-		const generation = session.surface.contentGeneration;
-		await retirements.get(agent);
-		let binding = bindings.get(agent);
-		if (binding !== void 0 && (!binding.connection.available || binding.harness !== command.id || binding.cwd !== cwd || binding.directory !== directory || binding.generation !== generation || binding.catalog !== catalog)) {
-			await retire(agent);
-			binding = void 0;
-		}
-		signal.throwIfAborted();
-		const shared = /* @__PURE__ */ new Set();
-		for (const seq of session.surface.nodes) {
-			const event = session.eventAt(seq);
-			if (event?.type === "tool/result" && event.data.message.toolCallId.startsWith("acp-hub-")) shared.add(event.data.message.toolCallId);
-		}
-		const text = projectContext(input, binding?.coveredTo, shared, schemas.some((schema) => schema.name === "skill"), config.maxContextBytes);
+		let turnBridge;
 		try {
+			if (config.toolSource === 'dsh') turnBridge = new DshTools(ctx, agent, config, selection, signal);
+			const schemas = turnBridge ? await turnBridge.refresh() : config.toolSource === 'external' ? [] : ctx.tools.schemas(agent, input.toolSet).filter((schema) => allow.has(schema.name));
+			const catalog = JSON.stringify(schemas);
+			const policyKey = JSON.stringify([config.nativeApproval, config.permissionMode || command.permissionMode]);
+			const generation = session.surface.contentGeneration;
+			await retirements.get(agent);
+			let binding = bindings.get(agent);
+			if (binding !== void 0 && (!binding.connection.available || binding.harness !== command.id || binding.cwd !== cwd || binding.directory !== directory || binding.generation !== generation || binding.catalog !== catalog || binding.policyKey !== policyKey)) {
+				await retire(agent);
+				binding = void 0;
+			}
+			signal.throwIfAborted();
+			const shared = /* @__PURE__ */ new Set();
+			for (const seq of session.surface.nodes) {
+				const event = session.eventAt(seq);
+				if (event?.type === "tool/result" && event.data.message.toolCallId.startsWith("acp-hub-")) shared.add(event.data.message.toolCallId);
+			}
+			if (binding) clearTimeout(binding.idle);
+			const prompt = await projectPrompt(input, binding?.coveredTo, shared, turnBridge?.hasSkill ?? schemas.some((schema) => schema.name === "skill"), config, ctx.get('attachments'), signal);
+			if (turnBridge) {
+				prompt[0].text += '\n' + toolGuide(turnBridge.guide);
+				if (Buffer.byteLength(prompt[0].text) > config.maxContextBytes) throw new Error('ACP context including the DSH tool guide exceeds the configured byte limit.');
+			}
 			if (binding === void 0) {
 				if (bindings.size + retirements.size >= config.maxBindings) throw new Error("ACP Hub has reached its connection limit. Close an active conversation or wait for an idle binding to expire.");
-				const connection = new AcpConnection(ctx.subprocess, command, cwd, config.cancelGraceMs, new Set(schemas.map((schema) => schema.name)));
-				const gateway = schemas.length === 0 ? void 0 : new Gateway(ctx, schemas, gated);
+				const gateway = schemas.length === 0 ? void 0 : new Gateway(ctx, schemas, gated, config.maxImageBytes);
+				const connection = new AcpConnection(ctx.subprocess, command, cwd, config.cancelGraceMs, gateway?.names ?? new Set());
 				binding = {
 					harness: command.id,
 					cwd,
 					directory,
 					generation,
 					catalog,
+					policyKey,
 					connection,
 					gateway,
 					coveredTo: void 0,
@@ -214,27 +239,35 @@ function apply(ctx, config) {
 				};
 				bindings.set(agent, binding);
 				const mcp = await gateway?.listen();
-				await connection.open(cwd, mcp, AbortSignal.any([signal, AbortSignal.timeout(config.startupMs)]));
+				await connection.open(cwd, mcp, AbortSignal.any([signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]));
 			}
 			clearTimeout(binding.idle);
-			await binding.connection.selectModel(model, AbortSignal.any([signal, AbortSignal.timeout(config.startupMs)]));
+			await binding.connection.selectModel(model, AbortSignal.any([signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]));
+			if (config.nativeApproval === 'agent') await binding.connection.selectPermissionMode(config.permissionMode || command.permissionMode, signal);
 			const prepared = appendPluginRecord(session, DELIVERY_RECORD, {
 				phase: "prepared",
 				turn,
 				step,
 				harness: command.id,
-				text
+				text: prompt[0].text
 			});
 			await flush(input);
 			signal.throwIfAborted();
 			binding.gateway?.begin({
 				...input,
-				signal
+				signal,
+				toolSet: turnBridge?.toolSet ?? input.toolSet,
+				...(turnBridge ? { refreshTools: async () => {
+					const next = await turnBridge.refresh();
+					binding.gateway.active.input.toolSet = turnBridge.toolSet;
+					binding.gateway.setTools(next);
+				} } : {}),
 			});
 			let outputBytes = 0;
 			let stop;
 			try {
-				stop = await binding.connection.prompt(text, {
+				stop = await binding.connection.prompt(prompt, {
+					onPermission: permissionHandler(ctx, agent, command.id, config.nativeApproval),
 					onText: (chunk) => {
 						outputBytes += Buffer.byteLength(chunk);
 						if (outputBytes > config.maxOutputBytes) throw new Error("ACP response exceeds the configured byte limit.");
@@ -268,7 +301,7 @@ function apply(ctx, config) {
 				throw new AggregateError([error, cleanupError], "ACP turn and binding cleanup both failed.", { cause: error });
 			}
 			throw error;
-		}
+		} finally { turnBridge?.dispose(); }
 	};
 	const driver = {
 		handles: (selection) => selection.provider === LEGACY_PROVIDER || providers.has(selection.provider),
@@ -284,7 +317,8 @@ function apply(ctx, config) {
 	if (config.execution === "released") ctx.on("llm/stream", (request, next) => {
 		const command = providers.get(request.provider);
 		if (command === void 0) return next();
-		return streamReleasedTurn(ctx, config, command, request, shutdown.signal, active);
+		const turnConfig = snapshot();
+		return streamReleasedTurn(ctx, turnConfig, { ...command, permissionMode: turnConfig.permissionMode || command.permissionMode }, request, shutdown.signal, active, gated);
 	});
 	else ctx.provide("agentTurnDriver", driver);
 	const discover = async (command) => {
@@ -292,11 +326,11 @@ function apply(ctx, config) {
 		const cwd = await mkdtemp(join(temp, "dsh-acp-models-"));
 		let connection;
 		try {
-			const signal = AbortSignal.any([shutdown.signal, AbortSignal.timeout(config.startupMs)]);
+			const signal = AbortSignal.any([shutdown.signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]);
 			signal.throwIfAborted();
 			connection = new AcpConnection(ctx.subprocess, command, cwd, config.cancelGraceMs, /* @__PURE__ */ new Set());
 			await connection.open(cwd, void 0, signal);
-			return connection.models;
+			return { models: connection.models, imageInput: connection.imageInput };
 		} finally {
 			try {
 				await connection?.close();

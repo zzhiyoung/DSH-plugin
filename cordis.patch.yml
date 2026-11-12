@@ -3,6 +3,10 @@
       name: dsh-acp-agent-hub
       config:
         execution: released
+        toolSource: dsh
+        toolApproval: rules
+        nativeApproval: dsh
+        startupMs: 0
         agents:
           - id: codex
             title: Codex

@@ -1,3 +1,6 @@
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+import { join } from 'node:path'
 const stubs = new Map([
   ['@deepseek-ai/dsh-llm', new URL('./stubs/dsh-llm.mjs', import.meta.url).href],
   ['@deepseek-ai/dsh-session', new URL('./stubs/dsh-session.mjs', import.meta.url).href],
@@ -16,6 +19,11 @@ const stubs = new Map([
  * @param next - the default resolver.
  */
 export async function resolve(specifier, context, next) {
+  const realRoot = specifier.startsWith('@modelcontextprotocol/') ? process.env.DSH_TEST_PROTOCOL_ROOT : specifier === '@deepseek-ai/schemastery' ? process.env.DSH_TEST_SCHEMA_ROOT : undefined
+  if (realRoot) {
+    const resolve = createRequire(join(realRoot, 'package.json')).resolve
+    return { url: pathToFileURL(resolve(specifier)).href, shortCircuit: true }
+  }
   const stub = stubs.get(specifier)
   if (stub !== undefined) return { url: stub, shortCircuit: true }
   return next(specifier, context)

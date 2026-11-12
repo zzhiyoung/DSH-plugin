@@ -20,3 +20,5 @@ export function ToolCallId(value) {
 export function isAgentLoopRequest() {
   return true
 }
+
+export function createAssistantMessage(value) { return { id: 'assistant-test', role: 'assistant', ...value } }

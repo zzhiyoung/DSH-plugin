@@ -1,10 +1,13 @@
+import { Gateway } from './gateway.js'
+import { DshTools, recordDshCall, toolGuide } from './tool-bridge.js'
+import { permissionHandler } from './approval.js'
 import { realpath, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { Readable } from 'node:stream'
 import { isAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
 import { AcpConnection } from './connection.js'
-import { projectContext } from './context.js'
+import { projectPrompt } from './context.js'
 import { createBlockWriter } from './stream-blocks.js'
 
 /** ACP text streaming through the public LLM waterfall in released DSH hosts. */
@@ -18,7 +21,7 @@ import { createBlockWriter } from './stream-blocks.js'
 * @param active - operations awaited when the plugin unloads.
 * @returns a DSH stream containing only visible assistant text.
 */
-export async function* streamReleasedTurn(ctx, config, command, request, shutdown, active) {
+export async function* streamReleasedTurn(ctx, config, command, request, shutdown, active, gated = new Set()) {
 	const agent = ctx.agents.currentInitiator();
 	if (!isAgentLoopRequest(request) || request.purpose !== void 0 || agent === void 0 || agent.session.header.origin === "subagent" || request.sessionId !== agent.session.id) throw new Error("ACP models are available only for root DSH conversations.");
 	if (active.size >= config.maxBindings) throw new Error("ACP Hub has reached its connection limit.");
@@ -33,19 +36,33 @@ export async function* streamReleasedTurn(ctx, config, command, request, shutdow
 			message: event.data
 		});
 	}
-	const text = projectContext({
+	const shared = new Set();
+	for (const seq of session.surface.nodes) {
+		const event = session.eventAt(seq);
+		if (event?.type === 'tool/result' && event.data.message.toolCallId?.startsWith('acp-hub-')) shared.add(event.data.message.toolCallId);
+	}
+	const contextTurn = {
 		agent,
 		inputs: inputs.reverse()
-	}, void 0, /* @__PURE__ */ new Set(), false, config.maxContextBytes);
+	};
 	const model = request.model === "@default" ? void 0 : request.model.slice(6);
 	if (model !== void 0 && (!request.model.startsWith("model:") || model === "")) throw new Error("Choose a model from the ACP agent’s model list.");
 	const controller = new AbortController();
 	const signal = AbortSignal.any([
 		controller.signal,
 		shutdown,
-		AbortSignal.timeout(config.promptMs),
 		...request.signal === void 0 ? [] : [request.signal]
 	]);
+	let bridge;
+	let gateway;
+	let connection;
+	const position = (() => {
+		for (let i = session.seq - 1; i >= 0; i--) {
+			const event = session.eventAt(SessionSeq(i));
+			if (event?.type === 'step/start') return { turn: event.data.turn, step: event.data.step };
+		}
+		return undefined;
+	})();
 	const chunks = new Readable({
 		objectMode: true,
 		read() {}
@@ -58,17 +75,43 @@ export async function* streamReleasedTurn(ctx, config, command, request, shutdow
 		if (!(await stat(cwd)).isDirectory()) throw new Error("The DSH workspace is not a directory.");
 		if (!await ctx.sessions.flush(session)) throw new Error("ACP Hub requires an active DSH session persistence listener.");
 		signal.throwIfAborted();
-		const connection = new AcpConnection(ctx.subprocess, command, cwd, config.cancelGraceMs, /* @__PURE__ */ new Set());
 		try {
-			const startup = AbortSignal.any([signal, AbortSignal.timeout(config.startupMs)]);
-			await connection.open(cwd, void 0, startup);
+			const useDsh = config.toolSource === 'dsh' || (config.toolSource === undefined && config.tools?.length > 0);
+			let schemas = [];
+			if (useDsh) {
+				if (!position) throw new Error('DSH tools require an active session step.');
+				bridge = new DshTools(ctx, agent, config, { provider: request.provider, model: request.model }, signal);
+				schemas = await bridge.refresh();
+				gateway = new Gateway(ctx, schemas, gated, config.maxImageBytes);
+			}
+			const prompt = await projectPrompt(contextTurn, undefined, shared, bridge?.hasSkill === true, config, ctx.get('attachments'), signal);
+			if (bridge) {
+				prompt[0].text += '\n' + toolGuide(bridge.guide);
+				if (Buffer.byteLength(prompt[0].text) > config.maxContextBytes) throw new Error('ACP context including the DSH tool guide exceeds the configured byte limit.');
+			}
+			connection = new AcpConnection(ctx.subprocess, command, cwd, config.cancelGraceMs, gateway?.names ?? new Set());
+			const mcp = await gateway?.listen();
+			const startup = AbortSignal.any([signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]);
+			await connection.open(cwd, mcp, startup);
 			await connection.selectModel(model, startup);
+			if (config.nativeApproval === 'agent') await connection.selectPermissionMode(command.permissionMode, startup);
 			let outputBytes = 0;
 			const account = (chunk) => {
 				outputBytes += Buffer.byteLength(chunk);
 				if (outputBytes > config.maxOutputBytes) throw new Error("ACP response exceeds the configured byte limit.");
 			};
-			return await connection.prompt(text, {
+			gateway?.begin({
+				agent, ...position, signal,
+				toolSet: bridge?.toolSet,
+				recordToolCall: (call) => recordDshCall(session, position, { provider: request.provider, model: request.model }, call),
+				refreshTools: async () => {
+					const schemas = await bridge.refresh();
+					gateway.active.input.toolSet = bridge.toolSet;
+					gateway.setTools(schemas);
+				},
+			});
+			const stop = await connection.prompt(prompt, {
+				onPermission: permissionHandler(ctx, agent, command.id, config.nativeApproval),
 				onText: (chunk) => {
 					account(chunk);
 					write.text(chunk);
@@ -79,8 +122,11 @@ export async function* streamReleasedTurn(ctx, config, command, request, shutdow
 				} : void 0,
 				signal
 			});
+			if (await gateway?.end() === false && !signal.aborted) throw new Error('DSH tool execution did not settle normally.');
+			return stop;
 		} finally {
-			await connection.close();
+			try { await gateway?.close(); }
+			finally { try { await connection?.close(); } finally { bridge?.dispose(); } }
 		}
 	})().then((stop) => ({
 		ok: true,

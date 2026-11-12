@@ -28,18 +28,11 @@ export class Gateway {
 	active;
 	tools;
 	names;
-	constructor(ctx, schema, gated) {
+	constructor(ctx, schema, gated, maxImageBytes = 20 * 1024 * 1024) {
+		this.maxImageBytes = maxImageBytes;
 		this.ctx = ctx;
 		this.gated = gated;
-		this.tools = schema.map(({ name, description, parameters }) => ({
-			name,
-			description,
-			inputSchema: {
-				...parameters,
-				type: "object"
-			}
-		}));
-		this.names = new Set(this.tools.map((tool) => tool.name));
+		this.setTools(schema);
 		this.listener.maxConnections = 16;
 		this.listener.on("request", (req, res) => {
 			this.handle(req, res).catch((_error) => {
@@ -48,6 +41,20 @@ export class Gateway {
 			});
 		});
 	}
+	setTools(schema) {
+		this.tools = schema.map(({ name, description, parameters }) => ({
+			name,
+			description,
+			inputSchema: {
+				...parameters,
+				type: "object"
+			}
+		}));
+		this.names ??= new Set();
+		this.names.clear();
+		for (const tool of this.tools) this.names.add(tool.name);
+	}
+
 	/** Bind to a private loopback port and return the ACP server declaration. */
 	async listen() {
 		await new Promise((resolve, reject) => {
@@ -129,7 +136,10 @@ export class Gateway {
 			name: "dsh",
 			version: "0.2.2-rc.1"
 		}, { capabilities: { tools: {} } });
-		server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: this.tools }));
+		server.setRequestHandler(ListToolsRequestSchema, async () => {
+			if (admission && this.active === admission && !admission.work) await admission.input.refreshTools?.();
+			return { tools: this.tools };
+		});
 		server.setRequestHandler(CallToolRequestSchema, ({ params }, extra) => this.call(admission, params.name, params.arguments ?? {}, extra.requestId, extra.signal));
 		const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
 		try {
@@ -170,6 +180,8 @@ export class Gateway {
 		};
 		this.gated.add(id);
 		try {
+			await input.refreshTools?.();
+			if (!this.names.has(name)) return toolError("This DSH tool is no longer available.");
 			input.recordToolCall(call);
 			const result = await this.ctx.agents.withInitiator(input.agent, () => this.ctx.tools.execute({
 				agent: input.agent,
@@ -181,12 +193,22 @@ export class Gateway {
 				},
 				calls: [call]
 			}));
+			// Checkpoint the DSH outcome before converting or bounding an external response.
+			if (!await this.ctx.sessions.flush(input.agent.session)) throw new Error('DSH tool outcome could not be checkpointed.');
 			const item = result.results[0]?.result;
 			if (item === void 0) return toolError("DSH did not report a tool result.");
-			const content = item.content.flatMap((block) => block.type === "text" ? [{
-				type: "text",
-				text: block.text
-			}] : []);
+			const content = [];
+			let imageBytes = 0;
+			for (const block of item.content) {
+				if (block.type === 'text') content.push({ type: 'text', text: block.text });
+				else if (block.type === 'image') {
+					imageBytes += block.attachment?.bytes;
+					if (!Number.isSafeInteger(imageBytes) || imageBytes > this.maxImageBytes) return toolError('DSH tool images exceed the transfer limit.');
+					const image = await this.ctx.get('attachments')?.readImage(block.attachment, signal);
+					if (!image) throw new Error('DSH image tool output is unavailable.');
+					content.push({ type: 'image', mimeType: image.ref.mediaType, data: Buffer.from(image.data).toString('base64') });
+				} else content.push({ type: 'text', text: `[DSH tool returned unsupported content: ${block.type}]` });
+			}
 			for (const context of result.additionalContexts) {
 				input.agent.session.append("user/message", context, { surfaceOp: "append" });
 				for (const block of context.content) if (block.type === "text") content.push({
@@ -199,7 +221,7 @@ export class Gateway {
 				active.failed = true;
 				active.abort.abort();
 			}
-			return Buffer.byteLength(JSON.stringify(content)) > 128 * 1024 ? toolError("DSH tool output exceeds the ACP transfer limit. Read a smaller result.") : {
+			return Buffer.byteLength(JSON.stringify(content.filter((b) => b.type !== 'image'))) > 128 * 1024 ? toolError("DSH tool output exceeds the ACP transfer limit. Read a smaller result.") : {
 				isError: item.isError,
 				content
 			};

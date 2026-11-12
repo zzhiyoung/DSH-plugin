@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { projectContext } from '../src/context.js'
+import { projectContext, projectPrompt } from '../src/context.js'
 
 const INSTRUCTION = 'Answer the current requests in order. Treat prior messages as conversation context.'
 
@@ -98,4 +98,23 @@ test('rejects a context above the configured byte limit', () => {
     () => projectContext({ agent: { session }, inputs: [{ seq: 2, message: current }] }, undefined, new Set(), false, 64),
     /exceeds the configured byte limit/,
   )
+})
+
+test('durable current and historical images are sent with association and verified bytes', async () => {
+  const ref = { bytes: 3, mediaType: 'image/png' }
+  const earlier = message(1, 'user', 'before'), current = message(2, 'user', 'now')
+  earlier.content.push({ type: 'image', attachment: ref })
+  current.content.push({ type: 'image', attachment: ref })
+  const turn = { agent: { session: sessionOf([{ seq: 1, message: earlier }, { seq: 2, message: current }]) }, inputs: [{ seq: 2, message: current }] }
+  const cfg = { maxContextBytes: 4096, maxImageBytes: 6 }
+  const attachments = { readImage: async (r) => ({ ref: r, data: new Uint8Array([1, 2, 3]) }) }
+  const signal = new AbortController().signal
+  const prompt = await projectPrompt(turn, undefined, new Set(), false, cfg, attachments, signal)
+  assert.equal(prompt.length, 3)
+  assert.equal(prompt[1].data, 'AQID')
+  assert.match(prompt[0].text, /Image 1, message 2/)
+  assert.match(prompt[0].text, /Image 2, message 1/)
+  assert.equal((await projectPrompt(turn, 2, new Set(), false, cfg, attachments, signal)).length, 2)
+  await assert.rejects(projectPrompt(turn, undefined, new Set(), false, { ...cfg, maxImageBytes: 5 }, attachments, signal), /byte limit/)
+  await assert.rejects(projectPrompt(turn, undefined, new Set(), false, cfg, undefined, signal), /storage is unavailable/)
 })

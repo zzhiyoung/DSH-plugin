@@ -1,0 +1,147 @@
+import assert from 'node:assert/strict'
+import { register } from 'node:module'
+import { PassThrough } from 'node:stream'
+import { test } from 'node:test'
+register(new URL('./support/hooks.mjs', import.meta.url).href)
+const { setClientFactory } = await import('@agentclientprotocol/sdk')
+const { AcpConnection } = await import('../src/connection.js')
+const { permissionHandler } = await import('../src/approval.js')
+const { streamReleasedTurn } = await import('../src/released.js')
+
+function harness({ image = true, run = async () => ({ stopReason: 'end_turn' }) } = {}) {
+  const handlers = new Map(), calls = []
+  const agent = { async request(method, params) {
+    calls.push({ method, params })
+    if (method === 'initialize') return { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image }, mcpCapabilities: { http: true } } }
+    if (method === 'session/new') return { sessionId: 's1' }
+    return run(handlers, params)
+  }, notify: async () => {} }
+  setClientFactory(() => ({
+    onNotification() { return this },
+    onRequest(method, handler) { handlers.set(method, handler); return this },
+    connect() { return { agent, closed: new Promise(() => {}), close() {} } },
+  }))
+  let terminated = false
+  const subprocess = { spawn: () => ({ stdin: new PassThrough(), stdout: new PassThrough(), done: new Promise(() => {}), terminate() { terminated = true }, waitForExit: async () => true }) }
+  const command = { id: 'fake', title: 'Fake', command: 'fake', args: [], env: [] }
+  return { calls, subprocess, command, get terminated() { return terminated }, connection: new AcpConnection(subprocess, command, process.cwd(), 10, new Set()) }
+}
+const permission = { sessionId: 's1', toolCall: { toolCallId: 't1', title: 'write file', rawInput: { path: 'a.txt' } }, options: [{ kind: 'allow_once', optionId: 'a' }, { kind: 'reject_once', optionId: 'r' }] }
+for (const outcome of ['allowed-once', 'rejected', 'unavailable', 'cancelled', 'unexpected']) {
+  test(`native permission maps ${outcome} without blanket approval`, async () => {
+    let answer
+    const h = harness({ run: async (handlers) => { answer = await handlers.get('session/request_permission')({ params: permission }); return { stopReason: 'end_turn' } } })
+    const signal = new AbortController().signal
+    await h.connection.open(process.cwd(), undefined, signal)
+    await h.connection.prompt('hi', { signal, onPermission: async () => outcome })
+    assert.equal(answer.outcome.optionId, outcome === 'allowed-once' ? 'a' : 'r')
+    await h.connection.close()
+  })
+}
+test('approval service receives owning agent, action details and live signal', async () => {
+  const agent = { session: {} }, signal = new AbortController().signal
+  let seen
+  const ctx = { get: () => ({ request: async (req) => { seen = req; return 'allowed-once' } }), agents: { withInitiator: (owner, fn) => { assert.equal(owner, agent); return fn() } } }
+  assert.equal(await permissionHandler(ctx, agent, 'fake')(permission, signal), 'allowed-once')
+  assert.equal(seen.agent, agent)
+  assert.equal(seen.signal, signal)
+  assert.match(seen.reason, /a.txt/)
+})
+test('missing approval service fails closed', async () => {
+  assert.equal(await permissionHandler({ get() {} }, {}, 'fake')(permission, new AbortController().signal), 'unavailable')
+})
+test('ACP image capability gates actual image prompts', async () => {
+  for (const image of [true, false]) {
+    const h = harness({ image }), signal = new AbortController().signal
+    await h.connection.open(process.cwd(), undefined, signal)
+    const prompt = [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }]
+    if (image) { await h.connection.prompt(prompt, { signal }); assert.deepEqual(h.calls.at(-1).params.prompt, prompt) }
+    else await assert.rejects(h.connection.prompt(prompt, { signal }), /does not advertise image/)
+    await h.connection.close()
+  }
+})
+test('released turn ignores legacy prompt deadline but honors user cancellation', async () => {
+  const h = harness({ run: async () => { await new Promise((r) => setTimeout(r, 30)); return { stopReason: 'end_turn' } } })
+  const message = { id: 'm', source: { kind: 'user' }, role: 'user', content: [{ type: 'text', text: 'hello' }] }
+  const session = { id: 's', seq: 1, header: { cwd: process.cwd() }, surface: { nodes: [0] }, eventAt: () => ({ type: 'user/message', data: message }), deriveEventMessage: (e) => e.data }
+  const agent = { session }, active = new Set()
+  const ctx = { agents: { currentInitiator: () => agent }, sessions: { flush: async () => true }, subprocess: h.subprocess, get() {} }
+  const cfg = { maxBindings: 8, maxContextBytes: 10000, promptMs: 1, startupMs: 0, cancelGraceMs: 10, maxOutputBytes: 1000 }
+  const request = { sessionId: 's', model: '@default' }
+  const results = []
+  for await (const item of streamReleasedTurn(ctx, cfg, h.command, request, new AbortController().signal, active)) results.push(item)
+  assert.equal(results.at(-1).type, 'finish')
+  assert.equal(active.size, 0)
+  const abort = new AbortController(); abort.abort(new Error('user cancelled'))
+  await assert.rejects(async () => { for await (const item of streamReleasedTurn(ctx, cfg, h.command, { ...request, signal: abort.signal }, new AbortController().signal, active)) {} }, /user cancelled/)
+})
+
+test('driver has no legacy prompt deadline and catalog preserves advertised images', async () => {
+  const { apply } = await import('../src/index.js')
+  const h = harness({ run: async () => { await new Promise((r) => setTimeout(r, 25)); return { stopReason: 'end_turn' } } })
+  let driver, catalog, dispose
+  const msg = { id: 'm', source: { kind: 'user' }, role: 'user', content: [{ type: 'text', text: 'hello' }] }
+  const session = { seq: 1, header: { cwd: process.cwd() }, surface: { nodes: [0], contentGeneration: 0 }, eventAt: () => ({ type: 'user/message', data: msg }), deriveEventMessage: (e) => e.data }
+  const ctx = { on() {}, provide: (name, value) => { driver = value }, effect: (fn) => { dispose = fn() }, llm: { registerAdapter: (providers, value) => { catalog = value } }, get() {}, tools: { schemas: () => [] }, sessions: { flush: async () => true }, subprocess: h.subprocess, logger: { warn() {} } }
+  const cfg = { agents: [h.command], execution: 'driver', tools: [], maxBindings: 8, maxContextBytes: 10000, promptMs: 1, startupMs: 0, cancelGraceMs: 10, maxOutputBytes: 1000, idleMs: 10000 }
+  apply(ctx, cfg)
+  assert.equal(await driver.run({ agent: { session }, selection: { provider: 'acp-fake', model: '@default' }, inputs: [{ seq: 0, message: msg }], signal: new AbortController().signal, emitText() {}, commitText() {} }), 'completed')
+  await dispose()
+  const released = { ...ctx, effect() {} }
+  apply(released, { ...cfg, execution: 'released' })
+  assert.deepEqual((await catalog.resolveModel('acp-fake', '@default')).inputModalities, ['text', 'image'])
+})
+
+test('native approval never selects allow_always and discards approval after cancellation', async () => {
+  for (const cancel of [false, true]) {
+    let answer
+    const controller = new AbortController()
+    const params = cancel ? permission : { ...permission, options: [{ kind: 'allow_always', optionId: 'forever' }] }
+    const h = harness({ run: async (handlers) => { answer = await handlers.get('session/request_permission')({ params }); return { stopReason: 'end_turn' } } })
+    await h.connection.open(process.cwd(), undefined, controller.signal)
+    const work = h.connection.prompt('hi', { signal: controller.signal, onPermission: async () => { if (cancel) controller.abort(new Error('cancelled')); return 'allowed-once' } })
+    if (cancel) { await assert.rejects(work, /cancelled/); assert.equal(answer.outcome.optionId, 'r') }
+    else { await work; assert.equal(answer.outcome.outcome, 'cancelled') }
+    await h.connection.close()
+  }
+})
+
+test('external permissions select only an advertised mode and require confirmation', async () => {
+  const h = harness(), signal = new AbortController().signal
+  await h.connection.open(process.cwd(), undefined, signal)
+  await assert.rejects(h.connection.selectPermissionMode('agent', signal), /does not advertise/)
+  h.connection.permissionConfig = { id: 'mode', type: 'select', options: [{ value: 'agent', name: 'Auto review' }] }
+  await assert.rejects(h.connection.selectPermissionMode('full-access', signal), /unavailable/)
+  h.connection.connection.agent.request = async (method, params) => { assert.equal(params.value, 'agent'); return { configOptions: [{ id: 'mode', currentValue: 'agent' }] } }
+  await h.connection.selectPermissionMode('agent', signal)
+  await h.connection.close()
+})
+test('released bridge performs DSH skill and existing MCP calls without replaying them in the outer stream', async () => {
+  const { Gateway } = await import('../src/gateway.js')
+  const oldListen = Gateway.prototype.listen
+  let gateway
+  Gateway.prototype.listen = async function () { gateway = this; return { name: 'dsh', type: 'http', url: 'http://127.0.0.1/fake', headers: [] } }
+  const executions = [], events = [{ type: 'step/start', data: { turn: 0, step: 0 } }, { type: 'user/message', data: { id: 'm', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'use DSH' }] } }]
+  const session = { id: 's', get seq() { return events.length }, header: { cwd: process.cwd() }, surface: { nodes: [1] }, eventAt: (seq) => events[seq], deriveEventMessage: (e) => e.data, append(type, data) { events.push({ type, data }); return { seq: events.length - 1 } } }
+  const agent = { session }, schemas = ['skill', 'mcp__existing__query'].map((name) => ({ name, parameters: { type: 'object' } }))
+  const h = harness({ run: async () => {
+    for (const [id, name] of ['skill', 'mcp__existing__query'].entries()) {
+      const result = await gateway.call(gateway.active, name, {}, id, new AbortController().signal)
+      assert.equal(result.isError, undefined)
+    }
+    return { stopReason: 'end_turn' }
+  } })
+  const ctx = { get() {}, subprocess: h.subprocess, agents: { currentInitiator: () => agent, withInitiator: (_, fn) => fn() }, sessions: { flush: async () => true }, tools: {
+    resolve: async () => ({ view: (scope) => scope === agent ? new Map(schemas.map((s) => [s.name, s])) : new Map(), dispose() {} }),
+    definitions: (scope, set) => [...set.view(scope).values()], selectExecutor: () => ({ describe: (defs) => ({ schemas: defs }) }),
+    execute: async (input) => { executions.push(input.calls[0].name); return { results: [{ result: { content: [{ type: 'text', text: 'ok' }] } }], additionalContexts: [] } },
+  } }
+  try {
+    const chunks = []
+    for await (const chunk of streamReleasedTurn(ctx, { toolSource: 'dsh', tools: [], maxBindings: 8, maxContextBytes: 20000, maxOutputBytes: 1000, startupMs: 0, cancelGraceMs: 10 }, h.command, { sessionId: 's', provider: 'acp-fake', model: '@default' }, new AbortController().signal, new Set())) chunks.push(chunk)
+    assert.deepEqual(executions, ['skill', 'mcp__existing__query'])
+    assert.equal(events.filter((e) => e.type === 'assistant/message').length, 2)
+    assert.equal(chunks.some((c) => c.blockType === 'tool-call'), false)
+    assert.equal(chunks.at(-1).type, 'finish')
+  } finally { Gateway.prototype.listen = oldListen }
+})

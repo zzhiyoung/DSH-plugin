@@ -95,7 +95,7 @@ test('reports the Default model entry when the agent cannot be discovered', asyn
   assert.equal(models[0].name, 'Codex · Default model')
 })
 
-test('rejects duplicate agent ids, malformed ids, and tools in released execution', () => {
+test('rejects duplicate agent ids and malformed ids', () => {
   const { ctx } = background()
 
   assert.throws(
@@ -106,10 +106,7 @@ test('rejects duplicate agent ids, malformed ids, and tools in released executio
     () => hub.apply(ctx, config({ agents: [{ id: 'Bad Id', title: 'Bad', command: 'x', args: [], env: [] }] })),
     /unique agent ids/,
   )
-  assert.throws(
-    () => hub.apply(ctx, config({ tools: ['read'] })),
-    /does not support the ACP tool gateway/,
-  )
+  assert.doesNotThrow(() => hub.apply(ctx, config({ tools: ['read'] })))
 })
 
 test('entry point ships the ACP adapter it injects into the Codex row', () => {

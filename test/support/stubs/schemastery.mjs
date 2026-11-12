@@ -1,6 +1,7 @@
 function schema() {
   const api = {
     required: () => api,
+    volatile: () => api,
     default: () => api,
     min: () => api,
     max: () => api,

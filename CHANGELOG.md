@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0
+
+- 默认 released 桌面模式接入 DSH 工具桥接：当前会话的工具、已注册 MCP、技能加载器，支持 native 与 PTC/run_code 执行器；目录按调用刷新并保留作用域和白名单。
+- 新增可热更新的插件设置：toolSource、tools、toolApproval、nativeApproval、permissionMode，接入宿主自动生成表单；默认按 DSH 规则处理，移除一律升级为询问的额外限制。
+- 外部原生工具可以跟随 CLI 实际声明的权限模式；未知模式明确失败，不猜厂商参数，不将自动审查等同于全量允许。残余 ACP 请求仍交 DSH 确认。
+- DSH 调用以独立 assistant 请求及工具结果写入原会话，避免外层流重复执行；支持工具图片结果及取消传递，保留 MCP 鉴权信息在 DSH。
+- 本机真实 MCP SDK 与 schema 合约检查通过；桌面设置表单、真实账号工具调用和厂商自动审查仍待端到端验收。
+
+## 0.5.0
+
+- 取消 released / driver 单轮截止，旧 promptMs 忽略；startupMs 默认 0 不限时，保留取消和退出清理。
+- ACP 原生工具逐次交给 DSH approval 审批；仅 allowed-once 有效，拒绝、取消、服务缺失或异常不允许。外部执行环境仍由 CLI 管理。
+- 读取当前及历史图片附件，转换 ACP image 块；模型目录能力来自 ACP 握手，新增独立 maxImageBytes。
+- probe 默认不限时，新增 --auth，输出图片能力，默认拒绝审批，隐藏可能包含临时密码的非 JSON 横幅。
+- Codex / WorkBuddy 实测握手声明 image 与 HTTP MCP；登录和桌面对话验收尚未完成。修正 README 会话复用及 GitHub 更新边界。
+- 核实依据和剩余工作见 docs/2026-11-12-调用链核实.md。
+
 ## 0.4.0
 
 ### 修复

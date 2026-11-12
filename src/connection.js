@@ -41,8 +41,12 @@ export class AcpConnection {
 	mcpName;
 	model;
 	initialModel;
+	permissionConfig;
+	modes;
 	auth;
 	promptSignal;
+	permission;
+	imageInput = false;
 	pendingMcpCalls = /* @__PURE__ */ new Set();
 	output;
 	thought;
@@ -91,7 +95,10 @@ export class AcpConnection {
 		this.connection = client({ name: "deepseek-harness-agent-hub" }).onNotification(methods.client.session.update, ({ params }) => {
 			if (params.sessionId !== this.sessionId) return Promise.resolve();
 			const update = params.update;
-			if (update.sessionUpdate === "config_option_update") this.model = modelConfig(update.configOptions);
+			if (update.sessionUpdate === "config_option_update") {
+				this.model = modelConfig(update.configOptions);
+				this.permissionConfig = update.configOptions?.find((o) => o.type === 'select' && (o.category === 'mode' || o.id === 'mode'));
+			}
 			if (this.promptSignal?.aborted !== false) return Promise.resolve();
 			if (update.sessionUpdate === "tool_call" && update._meta?.["is_mcp_tool_call"] === true) {
 				const input = update.rawInput;
@@ -103,13 +110,24 @@ export class AcpConnection {
 				else if (update.sessionUpdate === "agent_thought_chunk") this.emit(this.thought, update.content.text);
 			}
 			return Promise.resolve();
-		}).onRequest(methods.client.session.requestPermission, ({ params }) => {
+		}).onRequest(methods.client.session.requestPermission, async ({ params }) => {
 			if (this.promptSignal?.aborted === false && params.sessionId === this.sessionId && params._meta?.["is_mcp_tool_approval"] === true && this.pendingMcpCalls.delete(params.toolCall.toolCallId)) {
 				const allow = params.options.find((option) => option.kind === "allow_once");
 				if (allow !== void 0) return Promise.resolve({ outcome: {
 					outcome: "selected",
 					optionId: allow.optionId
 				} });
+			}
+			if (this.promptSignal?.aborted === false && params.sessionId === this.sessionId && this.permission) {
+				const signal = this.promptSignal;
+				const ask = this.permission;
+				let outcome;
+				try { outcome = await until(() => ask(params, signal), signal); }
+				catch { outcome = 'unavailable'; }
+				if (outcome === 'allowed-once' && this.promptSignal === signal && !signal.aborted) {
+					const allow = params.options.find((option) => option.kind === 'allow_once');
+					if (allow) return { outcome: { outcome: 'selected', optionId: allow.optionId } };
+				}
 			}
 			const reject = params.options.find((option) => option.kind === "reject_once");
 			return Promise.resolve(reject === void 0 ? { outcome: { outcome: "cancelled" } } : { outcome: {
@@ -152,6 +170,7 @@ export class AcpConnection {
 					version: "0.2.2-rc.1"
 				}
 			}), signal);
+			this.imageInput = result.agentCapabilities?.promptCapabilities?.image === true;
 			if (result.protocolVersion !== PROTOCOL_VERSION) throw new Error("Unsupported ACP protocol version.");
 			if (this.auth !== void 0) {
 				stage = "authenticate";
@@ -173,6 +192,8 @@ export class AcpConnection {
 			this.mcpName = mcp?.name;
 			this.model = modelConfig(session.configOptions);
 			this.initialModel = this.model?.currentValue;
+			this.permissionConfig = session.configOptions?.find((o) => o.type === 'select' && (o.category === 'mode' || o.id === 'mode'));
+			this.modes = session.modes;
 		} catch (error) {
 			if (error instanceof RequestError && error.code === -32e3) throw new Error("ACP authentication is required. Sign in with the configured agent CLI and retry.");
 			if (error instanceof RequestError) throw new Error(`ACP ${stage} failed with protocol code ${error.code}.`);
@@ -203,26 +224,43 @@ export class AcpConnection {
 		this.model = modelConfig(response.configOptions);
 		if (this.model?.currentValue !== value) throw new Error("The ACP agent did not confirm the selected model.");
 	}
+	/** Select only a mode actually advertised by this CLI; never guess an approval flag. */
+	async selectPermissionMode(value, signal) {
+		if (!value) return;
+		const option = this.permissionConfig;
+		if (option) {
+			if (option.currentValue === value) return;
+			const choices = option.options.flatMap((o) => o.options ?? [o]);
+			if (!choices.some((o) => o.value === value)) throw new Error(`ACP permission mode ${value} is unavailable; available: ${choices.map((o) => o.value).join(', ')}`);
+			const response = await until(() => this.connection.agent.request(methods.agent.session.setConfigOption, { sessionId: this.sessionId, configId: option.id, value }), signal);
+			this.permissionConfig = response.configOptions?.find((o) => o.id === option.id);
+			if (this.permissionConfig?.currentValue !== value) throw new Error('ACP agent did not confirm the permission mode.');
+			return;
+		}
+		if (!this.modes?.availableModes?.some((m) => m.id === value)) throw new Error(`This ACP agent does not advertise permission mode ${value}.`);
+		await until(() => this.connection.agent.request(methods.agent.session.setMode, { sessionId: this.sessionId, modeId: value }), signal);
+	}
+
 	/**
 	* Send one prompt. On cancellation, notify the ACP agent before process cleanup.
 	* @param text - complete prompt text.
 	* @param handlers - streamed text and reasoning sinks plus the owning abort signal.
 	*/
-	async prompt(text, { onText, onThought, signal }) {
+	async prompt(text, { onText, onThought, onPermission, signal }) {
 		const sessionId = this.sessionId;
 		if (sessionId === void 0 || this.closed) throw new Error("ACP session is unavailable.");
 		signal.throwIfAborted();
 		const agent = this.connection.agent;
+		const prompt = typeof text === 'string' ? [{ type: 'text', text }] : text;
+		if (prompt.some((block) => block.type === 'image') && !this.imageInput) throw new Error('This ACP agent does not advertise image prompt support.');
+		this.permission = onPermission;
 		this.promptSignal = signal;
 		this.output = onText;
 		this.thought = onThought;
 		this.outputError = void 0;
 		const pending = agent.request(methods.agent.session.prompt, {
 			sessionId,
-			prompt: [{
-				type: "text",
-				text
-			}]
+			prompt
 		});
 		try {
 			const result = await until(() => pending, signal);
@@ -239,6 +277,7 @@ export class AcpConnection {
 			if (error instanceof RequestError) throw new Error(`ACP session/prompt failed with protocol code ${error.code}.`);
 			throw error;
 		} finally {
+			this.permission = void 0;
 			this.promptSignal = void 0;
 			this.pendingMcpCalls.clear();
 			this.output = void 0;

@@ -20,7 +20,7 @@
 import { spawn } from 'node:child_process'
 
 const PROTOCOL_VERSION = 1
-const DEFAULTS = { timeoutMs: 20000, cwd: process.cwd() }
+const DEFAULTS = { timeoutMs: 0, cwd: process.cwd() }
 
 function parse(argv) {
   const options = { ...DEFAULTS, env: {}, command: [], timeout: undefined }
@@ -39,7 +39,12 @@ function parse(argv) {
     }
     if (token === '--timeout') {
       options.timeout = Number(argv[++index])
-      if (!Number.isFinite(options.timeout) || options.timeout <= 0) throw new Error('--timeout expects milliseconds')
+      if (!Number.isFinite(options.timeout) || options.timeout < 0) throw new Error('--timeout expects milliseconds (0 disables the deadline)')
+      continue
+    }
+    if (token === '--auth') {
+      options.auth = argv[++index]
+      if (!options.auth) throw new Error('--auth expects a method id')
       continue
     }
     if (token === '--cwd') {
@@ -56,7 +61,7 @@ function parse(argv) {
   return options
 }
 
-const USAGE = `Usage: node scripts/probe-acp.mjs [--env K=V] [--timeout ms] [--cwd dir] -- <command> [args...]
+const USAGE = `Usage: node scripts/probe-acp.mjs [--env K=V] [--auth method] [--timeout ms] [--cwd dir] -- <command> [args...]
 
 Starts an ACP agent, performs initialize and session/new, and prints every NDJSON
 frame plus a summary (protocol version, models, MCP capability, auth methods).
@@ -107,7 +112,7 @@ function receive(line) {
   try {
     message = JSON.parse(line)
   } catch {
-    process.stdout.write(`[non-json stdout] ${line}\n`)
+    process.stdout.write(`[non-json stdout omitted]\n`)
     return
   }
   process.stdout.write(`<-- ${line}\n`)
@@ -120,7 +125,7 @@ function receive(line) {
   }
   // Agent-to-client request: answer the ones a bare client can answer.
   if (message.method === 'session/request_permission') {
-    const allow = message.params?.options?.find((option) => option.kind === 'allow_once')
+    const allow = message.params?.options?.find((option) => option.kind === 'reject_once')
     const frame = allow === undefined
       ? { jsonrpc: '2.0', id: message.id, result: { outcome: { outcome: 'cancelled' } } }
       : { jsonrpc: '2.0', id: message.id, result: { outcome: { outcome: 'selected', optionId: allow.optionId } } }
@@ -148,10 +153,11 @@ child.stdout.on('data', (chunk) => {
 child.stderr.setEncoding('utf8')
 child.stderr.on('data', (chunk) => process.stderr.write(`[agent stderr] ${chunk}`))
 
-const deadline = setTimeout(() => {
+const timeoutMs = options.timeout ?? DEFAULTS.timeoutMs
+const deadline = timeoutMs > 0 ? setTimeout(() => {
   fail(new Error(`ACP handshake did not finish within ${options.timeout ?? DEFAULTS.timeoutMs} ms`))
-}, options.timeout ?? DEFAULTS.timeoutMs)
-deadline.unref?.()
+}, timeoutMs) : undefined
+deadline?.unref?.()
 
 function fail(error) {
   if (settled) return
@@ -177,6 +183,7 @@ try {
   if (init.protocolVersion !== PROTOCOL_VERSION) {
     throw new Error(`agent negotiated ACP protocolVersion ${init.protocolVersion}, plugin requires ${PROTOCOL_VERSION}`)
   }
+  if (options.auth) await send('authenticate', { methodId: options.auth })
   const session = await send('session/new', { cwd: options.cwd, mcpServers: [] })
   if (typeof session.sessionId !== 'string' || session.sessionId === '') {
     throw new Error('agent returned an empty session id')
@@ -189,6 +196,7 @@ try {
   process.stdout.write(`session: ${session.sessionId}\n`)
   process.stdout.write(`model selector: ${config === undefined ? 'absent (plugin will show the Default model row)' : `${config.id} (current ${config.currentValue})`}\n`)
   process.stdout.write(`models: ${models.length === 0 ? 'none advertised' : models.map((model) => model.value).join(', ')}\n`)
+  process.stdout.write(`image prompt: ${init.agentCapabilities?.promptCapabilities?.image === true ? 'yes' : 'no'}\n`)
   process.stdout.write(`mcp http: ${init.agentCapabilities?.mcpCapabilities?.http === true ? 'yes' : 'no'}\n`)
   const auth = init.authMethods?.map((method) => method.id) ?? []
   process.stdout.write(`auth methods: ${auth.length === 0 ? 'none advertised' : auth.join(', ')}\n`)
