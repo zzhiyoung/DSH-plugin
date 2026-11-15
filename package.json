@@ -1,13 +1,14 @@
 {
   "name": "dsh-acp-agent-hub",
-  "version": "0.6.0",
+  "version": "0.8.3",
   "description": "Codex, Qoder, WorkBuddy and other ACP agents as model providers in DeepSeek Harness (DSH)",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.svg",
+    "./client": "./client.js"
   },
   "license": "MIT",
   "author": "zzhiyoung",
@@ -31,10 +32,10 @@
     "codebuddy"
   ],
   "engines": {
-    "dsh": "0.2.2-rc.1"
+    "dsh": "*"
   },
   "scripts": {
-    "check": "node --check index.js && node --check codex-desktop.mjs && node --check scripts/probe-acp.mjs && node --check src/index.js && node --check src/approval.js && node --check src/tool-bridge.js && node --check src/codex-path.js && node --check src/connection.js && node --check src/context.js && node --check src/gateway.js && node --check src/released.js && node --check src/stream-blocks.js",
+    "check": "node --check index.js && node --check codex-desktop.mjs && node --check scripts/probe-acp.mjs && node --check src/index.js && node --check src/catalog.js && node --check src/approval.js && node --check src/tool-bridge.js && node --check src/codex-path.js && node --check src/connection.js && node --check src/context.js && node --check src/gateway.js && node --check src/released.js && node --check src/stream-blocks.js && node --check client.js && node --check src/qoder-path.js && node --check src/acp-result.js && node --check src/agent-connections.js",
     "test": "node --test \"test/*.test.js\"",
     "pack:tgz": "npm pack",
     "probe": "node scripts/probe-acp.mjs"
@@ -52,11 +53,12 @@
     "vendor/codex-acp/dist/index.js",
     "vendor/codex-acp/LICENSE",
     "vendor/codex-acp/package.json",
-    "vendor/codex-acp/README.md"
+    "vendor/codex-acp/README.md",
+    "client.js"
   ],
   "peerDependencies": {
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-session": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
@@ -68,6 +70,18 @@
       "patch": "./cordis.patch.yml",
       "platforms": [
         "win32"
+      ]
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-model-selection",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web",
+      "external": [
+        "react"
       ]
     }
   }

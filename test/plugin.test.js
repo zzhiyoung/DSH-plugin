@@ -14,7 +14,7 @@ function config(overrides = {}) {
       { id: 'codex', title: 'Codex', command: 'node.exe', args: [], env: [] },
       { id: 'qoder', title: 'Qoder', command: 'qodercli.exe', args: ['--acp'], env: [] },
     ],
-    execution: 'released',
+    execution: 'released', connectOnStart: false,
     tools: [],
     ...overrides,
   }
@@ -26,6 +26,8 @@ function background() {
   const effects = []
   const adapters = []
   const ctx = {
+    subprocess: { spawn() { throw new Error('CLI unavailable') } },
+    sessions: { flush: async () => true },
     logger: { warn() {} },
     on(event, handler) {
       listeners.push({ event, handler })
@@ -85,14 +87,36 @@ test('driver execution provides a root-turn driver that only handles its own pro
   assert.equal(driver.handles({ provider: 'deepseek' }), false)
 })
 
-test('reports the Default model entry when the agent cannot be discovered', async () => {
+test('labels an undiscovered default route as failed instead of suggesting it is ready', async () => {
   const { ctx, adapters } = background()
   hub.apply(ctx, config())
 
   const models = await adapters[0].adapter.listModels('acp-codex')
 
   assert.deepEqual(models.map((model) => model.id), ['@default'])
-  assert.equal(models[0].name, 'Codex · Default model')
+  assert.equal(models[0].name, 'Codex · 检测失败')
+})
+
+test('host self-check rejects missing interfaces, independent of host version', () => {
+  const { ctx, adapters } = background()
+  delete ctx.llm.registerAdapter
+  assert.throws(() => hub.apply(ctx, config()), /宿主接口自检失败.*llm.registerAdapter/)
+  assert.equal(adapters.length, 0)
+})
+
+test('refresh command validates provider and waits for its discovery', async () => {
+  const { ctx, adapters } = background()
+  let command
+  ctx.inject = (_, fn) => fn({ commands: { register(value) { command = value } } })
+  hub.apply(ctx, config())
+  const catalog = adapters[0].adapter
+  let calls = 0
+  catalog.discover = async () => { calls++; return { models: [], imageInput: false } }
+  assert.equal((await command.handler({ rawInput: 'unknown' })).kind, 'error')
+  assert.equal(calls, 0)
+  assert.equal((await command.handler({ rawInput: ' acp-codex ' })).kind, 'success')
+  assert.equal((await command.handler({ rawInput: 'acp-codex' })).kind, 'success')
+  assert.equal(calls, 2)
 })
 
 test('rejects duplicate agent ids and malformed ids', () => {

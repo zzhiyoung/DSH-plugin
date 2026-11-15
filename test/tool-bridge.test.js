@@ -47,7 +47,9 @@ test('rules mode preserves DSH allow/ask/deny; ask mode never weakens deny', asy
   for (const toolApproval of ['rules', 'ask']) {
     let hook
     const ctx = { on: (event, fn) => { if (event === 'tools/pre-execute') hook = fn }, llm: { registerAdapter() {} }, provide() {}, effect() {} }
-    apply(ctx, { agents: [{ id: 'fake', title: 'Fake', command: 'x', args: [], env: [] }], tools: [], toolApproval })
+    ctx.subprocess = { spawn() {} }
+    ctx.sessions = { flush: async () => true }
+    apply(ctx, { connectOnStart: false, agents: [{ id: 'fake', title: 'Fake', command: 'x', args: [], env: [] }], tools: [], toolApproval })
     for (const kind of ['allow', 'ask', 'deny']) assert.equal((await hook({ callId: 'unrelated' }, async () => ({ kind }))).kind, kind)
   }
 })

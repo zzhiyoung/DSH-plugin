@@ -19,7 +19,7 @@ const stubs = new Map([
  * @param next - the default resolver.
  */
 export async function resolve(specifier, context, next) {
-  const realRoot = specifier.startsWith('@modelcontextprotocol/') ? process.env.DSH_TEST_PROTOCOL_ROOT : specifier === '@deepseek-ai/schemastery' ? process.env.DSH_TEST_SCHEMA_ROOT : undefined
+  const realRoot = specifier.startsWith('@modelcontextprotocol/') ? process.env.DSH_TEST_PROTOCOL_ROOT : specifier === '@agentclientprotocol/sdk' ? process.env.DSH_TEST_ACP_ROOT : specifier === '@deepseek-ai/schemastery' ? process.env.DSH_TEST_SCHEMA_ROOT : undefined
   if (realRoot) {
     const resolve = createRequire(join(realRoot, 'package.json')).resolve
     return { url: pathToFileURL(resolve(specifier)).href, shortCircuit: true }

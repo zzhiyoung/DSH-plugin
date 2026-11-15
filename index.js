@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { apply as applyHub, Config, inject, name } from './src/index.js'
+import { planQoder } from './src/qoder-path.js'
 
 export { Config, inject, name }
 
@@ -89,21 +90,35 @@ function locateWorkBuddy() {
  * @returns the patched row, or undefined when the agent is unavailable.
  */
 export function planWorkBuddy(agent, cli = locateWorkBuddy()) {
-  if (agent.id !== WORKBUDDY || agent.args.length > 0) return agent
+  if (agent.id !== WORKBUDDY) return agent
+  // WorkBuddy authenticate() explicitly logs out first; do not force a login by default.
+  agent = { ...agent, authMode: agent.authMode ?? 'existing' }
+  if (agent.args.length > 0) return agent
   if (cli === undefined) return undefined
   const hasDirectory = cli.includes('\\') || cli.includes('/')
   const dist = hasDirectory ? join(dirname(cli), '..', 'dist') : undefined
-  const desktopLayout = dist !== undefined && existsSync(join(dist, 'codebuddy-lite-wb.mjs')) && !existsSync(join(dist, 'codebuddy-headless.js'))
+  const hasLiteBundle = dist !== undefined && existsSync(join(dist, 'codebuddy-lite-wb.mjs'))
+  const hasHeadlessBundle = dist !== undefined && existsSync(join(dist, 'codebuddy-headless.js'))
+  const desktopLayout = hasLiteBundle && !hasHeadlessBundle
+  // Both bundles expose stdio ACP through a local HTTP server. The standalone
+  // full CLI otherwise binds a fixed port that the running WorkBuddy desktop
+  // already owns (EADDRINUSE on 127.0.0.1:13034), so always ask for a free one.
+  const serveAcp = desktopLayout || hasHeadlessBundle
   const args = [
-    ...(desktopLayout ? ['--serve'] : []),
+    ...(serveAcp ? ['--serve'] : []),
     '--acp',
     '--acp-transport',
     'stdio',
-    ...(desktopLayout ? ['--port', '0'] : []),
+    ...(serveAcp ? ['--port', '0'] : []),
   ]
-  const env = desktopLayout && !agent.env.some((entry) => entry.split('=')[0] === 'CODEBUDDY_FORCE_LITE_WB_BUNDLE')
-    ? [...agent.env, 'CODEBUDDY_FORCE_LITE_WB_BUNDLE=1']
-    : agent.env
+  const env = [...agent.env]
+  if (desktopLayout) {
+    // The desktop's encrypted auth store requires its private bootstrap environment.
+    // A standalone ACP process keeps its own login in memory instead of watching/writing that store.
+    for (const variable of ['CODEBUDDY_FORCE_LITE_WB_BUNDLE', 'CODEBUDDY_CREDENTIALS_IN_MEMORY']) {
+      if (!env.some((entry) => entry.split('=')[0] === variable)) env.push(`${variable}=1`)
+    }
+  }
   const override = process.env.DSH_ACP_WORKBUDDY_AUTH?.trim()
   const auth = agent.auth ?? (override === undefined || override === '' ? 'internal' : override)
   return /\.(?:exe|cmd|bat)$/i.test(cli) || !hasDirectory
@@ -121,6 +136,10 @@ export function planWorkBuddy(agent, cli = locateWorkBuddy()) {
 export function apply(ctx, config) {
   const agents = []
   for (const agent of config.agents) {
+    if (agent.id === 'qoder') {
+      agents.push(planQoder(agent))
+      continue
+    }
     if (agent.id === 'codex' && agent.args.length === 0) {
       const entry = process.env.DSH_ACP_CODEX_ENTRY || bundledAdapter
       agents.push({ ...agent, args: ['--import', codexDesktop, entry] })

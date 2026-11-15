@@ -7,6 +7,8 @@
         toolApproval: rules
         nativeApproval: dsh
         startupMs: 0
+        connectOnStart: true
+        loginMs: 180000
         agents:
           - id: codex
             title: Codex
@@ -14,10 +16,10 @@
             env: [CODEX_PATH, CODEX_HOME]
           - id: qoder
             title: Qoder
-            command: !!js process.env.DSH_ACP_QODER || process.env.USERPROFILE + '/.qoder/bin/qodercli/qodercli.exe'
+            command: !!js process.env.DSH_ACP_QODER || 'qodercli'
             args: [--acp]
           - id: workbuddy
             title: WorkBuddy
             command: !!js process.env.DSH_ACP_NODE || 'node.exe'
-            auth: internal
+            authMode: existing
             env: [CODEBUDDY_AUTH_TOKEN, CODEBUDDY_API_KEY, CODEBUDDY_CONFIG_DIR]

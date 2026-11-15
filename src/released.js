@@ -21,7 +21,7 @@ import { createBlockWriter } from './stream-blocks.js'
 * @param active - operations awaited when the plugin unloads.
 * @returns a DSH stream containing only visible assistant text.
 */
-export async function* streamReleasedTurn(ctx, config, command, request, shutdown, active, gated = new Set()) {
+export async function* streamReleasedTurn(ctx, config, command, request, shutdown, active, gated = new Set(), observe = () => {}, connections) {
 	const agent = ctx.agents.currentInitiator();
 	if (!isAgentLoopRequest(request) || request.purpose !== void 0 || agent === void 0 || agent.session.header.origin === "subagent" || request.sessionId !== agent.session.id) throw new Error("ACP models are available only for root DSH conversations.");
 	if (active.size >= config.maxBindings) throw new Error("ACP Hub has reached its connection limit.");
@@ -55,6 +55,8 @@ export async function* streamReleasedTurn(ctx, config, command, request, shutdow
 	]);
 	let bridge;
 	let gateway;
+	let gatewayClose;
+	const closeGateway = () => gatewayClose ??= gateway?.close();
 	let connection;
 	const position = (() => {
 		for (let i = session.seq - 1; i >= 0; i--) {
@@ -89,16 +91,16 @@ export async function* streamReleasedTurn(ctx, config, command, request, shutdow
 				prompt[0].text += '\n' + toolGuide(bridge.guide);
 				if (Buffer.byteLength(prompt[0].text) > config.maxContextBytes) throw new Error('ACP context including the DSH tool guide exceeds the configured byte limit.');
 			}
-			connection = new AcpConnection(ctx.subprocess, command, cwd, config.cancelGraceMs, gateway?.names ?? new Set());
 			const mcp = await gateway?.listen();
 			const startup = AbortSignal.any([signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]);
-			await connection.open(cwd, mcp, startup);
-			await connection.selectModel(model, startup);
-			if (config.nativeApproval === 'agent') await connection.selectPermissionMode(command.permissionMode, startup);
-			let outputBytes = 0;
-			const account = (chunk) => {
-				outputBytes += Buffer.byteLength(chunk);
-				if (outputBytes > config.maxOutputBytes) throw new Error("ACP response exceeds the configured byte limit.");
+			const perform = async (connection) => {
+				await connection.selectModel(model, startup);
+				observe({ type: 'connected', models: connection.models, imageInput: connection.imageInput });
+				if (config.nativeApproval === 'agent') await connection.selectPermissionMode(command.permissionMode, startup);
+				let outputBytes = 0;
+				const account = (chunk) => {
+					outputBytes += Buffer.byteLength(chunk);
+					if (outputBytes > config.maxOutputBytes) throw new Error("ACP response exceeds the configured byte limit.");
 			};
 			gateway?.begin({
 				agent, ...position, signal,
@@ -124,8 +126,15 @@ export async function* streamReleasedTurn(ctx, config, command, request, shutdow
 			});
 			if (await gateway?.end() === false && !signal.aborted) throw new Error('DSH tool execution did not settle normally.');
 			return stop;
+			};
+			if (connections) return await connections.use(command, { cwd, mcp, mcpTools: gateway?.names ?? new Set(), signal }, async (live) => {
+				try { return await perform(live); } finally { await closeGateway(); }
+			});
+			connection = new AcpConnection(ctx.subprocess, command, cwd, config.cancelGraceMs, gateway?.names ?? new Set());
+			await connection.open(cwd, mcp, startup);
+			return await perform(connection);
 		} finally {
-			try { await gateway?.close(); }
+			try { await closeGateway(); }
 			finally { try { await connection?.close(); } finally { bridge?.dispose(); } }
 		}
 	})().then((stop) => ({
@@ -136,6 +145,7 @@ export async function* streamReleasedTurn(ctx, config, command, request, shutdow
 		error
 	})).then((result) => {
 		if (result.ok) write.flush();
+		observe({ type: 'outcome', model: request.model, error: result.ok ? (['end_turn', 'max_tokens'].includes(result.stop) ? undefined : new Error('ACP turn stopped unexpectedly.')) : result.error });
 		return result;
 	}).finally(() => {
 		active.delete(done);
@@ -148,8 +158,16 @@ export async function* streamReleasedTurn(ctx, config, command, request, shutdow
 			yield chunk;
 		}
 		const result = await done;
-		if (!result.ok) throw result.error;
 		signal.throwIfAborted();
+		if (!result.ok) {
+			// The plugin may resolve a different HarnessError class instance than the host.
+			// Carry normalized codes on the stream instead of relying on cross-package instanceof.
+			if (['AUTH', 'QUOTA', 'RATE_LIMIT', 'SERVER', 'ACP_REFUSAL', 'EMPTY_RESPONSE'].includes(result.error?.code)) {
+				yield { type: 'finish', reason: { kind: 'error', failure: { code: result.error.code, message: result.error.message } } };
+				return;
+			}
+			throw result.error;
+		}
 		if (result.stop !== "end_turn" && result.stop !== "max_tokens") throw new Error("ACP agent stopped with " + result.stop + ". Review the conversation before continuing.");
 		yield {
 			type: "finish",

@@ -1,9 +1,9 @@
 import { DshTools, toolGuide } from './tool-bridge.js'
 import { permissionHandler, dshToolDecision } from './approval.js'
-import { mkdtemp, realpath, rm, stat } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
-import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { realpath, stat } from 'node:fs/promises'
+import { isAbsolute } from 'node:path'
+import { Catalog } from './catalog.js'
+import { AgentConnections } from './agent-connections.js'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { AcpConnection } from './connection.js'
@@ -29,6 +29,7 @@ const Config = z.object({
 		args: z.array(z.string()).default([]),
 		env: z.array(z.string()).default([]),
 		auth: z.string(),
+		authMode: z.union([z.const('existing'), z.const('authenticate')]).description('existing 仅使用已有 CLI 凭据；authenticate 显式重新认证，WorkBuddy 可能使桌面登录失效'),
 		permissionMode: z.string().description('外部 agent 的权限模式 ID；仅选择其实际声明支持的模式')
 	})).required(),
 	execution: z.union([z.const("driver"), z.const("released")]).default("released"),
@@ -38,6 +39,10 @@ const Config = z.object({
 	nativeApproval: z.union([z.const('dsh'), z.const('agent'), z.const('deny')]).default('dsh').volatile().description('原生工具：DSH 确认 / 跟随外部 agent 权限模式 / 拒绝 ACP 审批'),
 	permissionMode: z.string().default('').volatile().description('外部 agent 权限模式 ID；留空沿用当前模式；例如 Codex 的 agent 是 Auto review，不是全量放行'),
 	startupMs: z.natural().max(12e4).default(0),
+	connectOnStart: z.boolean().default(true).description('插件启动后自动连接各 agent 一次；不自动登录'),
+	loginMs: z.natural().min(1000).max(600000).default(180000).description('手动刷新发起登录的最长等待毫秒'),
+	discoveryMs: z.natural().min(1).max(12e4).default(60000).description('后台模型目录探测截止毫秒；独立于对话运行时间，冷启动可能超过 15 秒'),
+	discoveryWaitMs: z.natural().max(3000).default(800).description('菜单首次等候目录的毫秒预算，超出先显示默认模型'),
 	// Accepted for existing installations; no prompt deadline is applied.
 	promptMs: z.natural().default(0),
 	maxImageBytes: z.natural().min(1024).max(64 * 1024 * 1024).default(20 * 1024 * 1024),
@@ -54,74 +59,6 @@ const DEFAULT_MODEL = "@default";
 const MODEL_PREFIX = "model:";
 const DELIVERY_RECORD = "plugin:acp-agent-hub/delivery";
 const RELEASED_HOST_HEADROOM_TOKENS = 65536;
-/** Provider directory entry used by the existing DSH selector. Inference belongs to the turn driver. */
-var Catalog = class extends LlmAdapter {
-	providers;
-	discover;
-	releasedContextWindow;
-	cache = /* @__PURE__ */ new Map();
-	constructor(providers, discover, releasedContextWindow) {
-		super();
-		this.providers = providers;
-		this.discover = discover;
-		this.releasedContextWindow = releasedContextWindow;
-	}
-	providerInfo(provider) {
-		return {
-			id: provider,
-			name: this.providers.get(provider)?.title ?? provider
-		};
-	}
-	async resolveModel(provider, model, signal) {
-		if (this.releasedContextWindow === void 0) return super.resolveModel(provider, model, signal);
-		return Promise.resolve({
-			provider,
-			id: model,
-			name: model,
-			inputModalities: (await this.listModels(provider)).find((row) => row.id === model)?.inputModalities ?? ["text"],
-			context: { contextWindow: this.releasedContextWindow }
-		});
-	}
-	listModels(provider) {
-		const harness = this.providers.get(provider);
-		if (harness === void 0) return Promise.resolve([]);
-		const cached = this.cache.get(provider);
-		if (cached !== void 0 && cached.expires > Date.now()) return cached.models;
-		const fallback = {
-			id: DEFAULT_MODEL,
-			provider,
-			name: `${harness.title} · Default model`,
-			inputModalities: ["text"]
-		};
-		const result = this.discover(harness).then(({ models, imageInput }) => [{ ...fallback, inputModalities: imageInput ? ["text", "image"] : ["text"] }, ...models.map((model) => ({
-			id: MODEL_PREFIX + model.value,
-			provider,
-			name: `${harness.title} · ${model.name}`,
-			...model.description == null ? {} : { description: model.description },
-			inputModalities: imageInput ? ["text", "image"] : ["text"]
-		}))], (_error) => {
-			this.cache.delete(provider);
-			return [fallback];
-		});
-		this.cache.set(provider, {
-			expires: Date.now() + 3e4,
-			models: result
-		});
-		return result;
-	}
-	async *stream() {
-		yield {
-			type: "finish",
-			reason: {
-				kind: "error",
-				failure: {
-					message: "ACP routes run only as root conversation agents.",
-					code: "UNKNOWN"
-				}
-			}
-		};
-	}
-};
 async function close(binding) {
 	clearTimeout(binding.idle);
 	const outcomes = await Promise.allSettled([binding.gateway?.close(), binding.connection.close()]);
@@ -143,6 +80,11 @@ export function configSnapshot(config) {
 	};
 }
 function apply(ctx, config) {
+	const missing = [];
+	for (const [label, fn] of [['ctx.on', ctx.on], ['ctx.effect', ctx.effect], ['llm.registerAdapter', ctx.llm?.registerAdapter], ['subprocess.spawn', ctx.subprocess?.spawn], ['sessions.flush', ctx.sessions?.flush], ['session.appendPluginRecord', appendPluginRecord], ...(config.execution === 'driver' ? [['ctx.provide', ctx.provide]] : [])]) {
+		if (typeof fn !== 'function') missing.push(label);
+	}
+	if (missing.length) throw new Error(`ACP Hub 宿主接口自检失败：${missing.join(', ')}。当前 DSH 缺少必要能力，请更新插件或宿主。`);
 	const byId = new Map(config.agents.map((agent) => [agent.id, agent]));
 	if (byId.size === 0 || byId.size !== config.agents.length || config.agents.some((agent) => !/^[a-z0-9][a-z0-9_-]*$/.test(agent.id) || agent.command.trim() === "" || agent.title.trim() === "" || agent.env.some((entry) => !/^[A-Za-z_][A-Za-z0-9_]*(?:=[\s\S]*)?$/.test(entry)))) throw new Error("ACP Hub requires unique agent ids, nonempty commands and titles, and environment entries that are variable names or NAME=VALUE pairs.");
 	const providers = new Map(config.agents.map((agent) => [PROVIDER_PREFIX + agent.id, agent]));
@@ -151,6 +93,7 @@ function apply(ctx, config) {
 	const bindings = /* @__PURE__ */ new Map();
 	const retirements = /* @__PURE__ */ new Map();
 	const active = /* @__PURE__ */ new Set();
+	const discoveries = new Set();
 	const shutdown = new AbortController();
 	const gated = /* @__PURE__ */ new Set();
 	const retire = (agent) => {
@@ -200,12 +143,12 @@ function apply(ctx, config) {
 		try {
 			if (config.toolSource === 'dsh') turnBridge = new DshTools(ctx, agent, config, selection, signal);
 			const schemas = turnBridge ? await turnBridge.refresh() : config.toolSource === 'external' ? [] : ctx.tools.schemas(agent, input.toolSet).filter((schema) => allow.has(schema.name));
-			const catalog = JSON.stringify(schemas);
+			const toolCatalog = JSON.stringify(schemas);
 			const policyKey = JSON.stringify([config.nativeApproval, config.permissionMode || command.permissionMode]);
 			const generation = session.surface.contentGeneration;
 			await retirements.get(agent);
 			let binding = bindings.get(agent);
-			if (binding !== void 0 && (!binding.connection.available || binding.harness !== command.id || binding.cwd !== cwd || binding.directory !== directory || binding.generation !== generation || binding.catalog !== catalog || binding.policyKey !== policyKey)) {
+			if (binding !== void 0 && (!binding.connection.available || binding.harness !== command.id || binding.cwd !== cwd || binding.directory !== directory || binding.generation !== generation || binding.catalog !== toolCatalog || binding.policyKey !== policyKey)) {
 				await retire(agent);
 				binding = void 0;
 			}
@@ -230,7 +173,7 @@ function apply(ctx, config) {
 					cwd,
 					directory,
 					generation,
-					catalog,
+					catalog: toolCatalog,
 					policyKey,
 					connection,
 					gateway,
@@ -243,6 +186,7 @@ function apply(ctx, config) {
 			}
 			clearTimeout(binding.idle);
 			await binding.connection.selectModel(model, AbortSignal.any([signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]));
+			catalog.acceptConnection(legacy ? PROVIDER_PREFIX + command.id : selection.provider, { models: binding.connection.models, imageInput: binding.connection.imageInput });
 			if (config.nativeApproval === 'agent') await binding.connection.selectPermissionMode(config.permissionMode || command.permissionMode, signal);
 			const prepared = appendPluginRecord(session, DELIVERY_RECORD, {
 				phase: "prepared",
@@ -292,8 +236,10 @@ function apply(ctx, config) {
 				retireObserved(agent);
 			}, config.idleMs);
 			binding.idle.unref();
+			catalog.recordOutcome(legacy ? PROVIDER_PREFIX + command.id : selection.provider, selection.model);
 			return stop === "max_tokens" ? "max-tokens" : "completed";
 		} catch (error) {
+			catalog.recordOutcome(legacy ? PROVIDER_PREFIX + command.id : selection.provider, selection.model, error);
 			try {
 				await retire(agent);
 			} catch (cleanupError) {
@@ -318,41 +264,66 @@ function apply(ctx, config) {
 		const command = providers.get(request.provider);
 		if (command === void 0) return next();
 		const turnConfig = snapshot();
-		return streamReleasedTurn(ctx, turnConfig, { ...command, permissionMode: turnConfig.permissionMode || command.permissionMode }, request, shutdown.signal, active, gated);
+		return streamReleasedTurn(ctx, turnConfig, { ...command, permissionMode: turnConfig.permissionMode || command.permissionMode }, request, shutdown.signal, active, gated, (event) => {
+			if (event.type === 'connected') catalog.acceptConnection(request.provider, event);
+			else catalog.recordOutcome(request.provider, event.model, event.error);
+		}, connections);
 	});
 	else ctx.provide("agentTurnDriver", driver);
-	const discover = async (command) => {
-		const temp = await realpath(tmpdir());
-		const cwd = await mkdtemp(join(temp, "dsh-acp-models-"));
-		let connection;
+	const discover = async (command, options) => {
 		try {
-			const signal = AbortSignal.any([shutdown.signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]);
-			signal.throwIfAborted();
-			connection = new AcpConnection(ctx.subprocess, command, cwd, config.cancelGraceMs, /* @__PURE__ */ new Set());
-			await connection.open(cwd, void 0, signal);
-			return { models: connection.models, imageInput: connection.imageInput };
-		} finally {
-			try {
-				await connection?.close();
-			} finally {
-				if (dirname(cwd) === temp) await rm(cwd, {
-					recursive: true,
-					force: true
-				});
-			}
+			return await connections.inspect(command, options);
+		} catch (error) {
+			// Use known categories rather than exposing CLI output, which may contain credentials.
+			const message = error instanceof Error ? error.message : '';
+			const diagnostic = error?.code === 'AUTH' || /authentication is required|authentication required/i.test(message)
+				? 'CLI 需要登录；点击刷新可发起一次登录并验证。'
+				: error?.code === 'ENOENT' ? '未找到 CLI，请检查安装位置或启动路径。'
+				: error?.name === 'TimeoutError' ? `检测超时（阶段：${error.acpStage ?? '连接/验证'}），可稍后刷新。`
+				: `CLI 检测失败（阶段：${error.acpStage ?? '连接/验证'}），请检查路径和登录状态。`;
+			if (error instanceof Error) error.discoveryDiagnostic = diagnostic;
+			if (!shutdown.signal.aborted) ctx.logger.warn(`ACP model discovery for ${command.id} did not complete at ${error.acpStage ?? 'connection/check'}; check CLI path/login and retry after the cooldown.`);
+			throw error;
 		}
 	};
 	const contextWindow = config.execution === "released" ? RELEASED_HOST_HEADROOM_TOKENS + Math.max(16384, Math.floor(config.maxContextBytes / 4)) : void 0;
-	ctx.llm.registerAdapter([...providers.keys()], new Catalog(providers, (command) => {
-		const work = discover(command).finally(() => {
-			active.delete(work);
+	const connections = new AgentConnections(ctx, config, shutdown.signal, (id, phase) => catalog.setPhase(PROVIDER_PREFIX + id, phase));
+	const catalog = new Catalog(providers, (command, options) => {
+		const work = discover(command, options).finally(() => {
+			discoveries.delete(work);
 		});
-		active.add(work);
+		discoveries.add(work);
 		return work;
-	}, contextWindow));
+	}, contextWindow, {
+		waitMs: config.discoveryWaitMs ?? 800,
+		onChanged: (provider) => { if (!shutdown.signal.aborted) ctx.emit?.('llm/models-updated', provider); },
+	});
+	ctx.llm.registerAdapter([...providers.keys()], catalog);
+	if (config.connectOnStart !== false) catalog.start().catch(() => ctx.logger.warn('ACP startup discovery did not complete.'));
+	ctx.inject?.(['commands'], (scope) => {
+		scope.commands.register({
+			name: 'acp-refresh', description: '刷新 ACP 模型连接和目录（不影响已有会话）',
+			input: { hint: '提供方 ID，例如 acp-codex' },
+			handler: async ({ rawInput }) => {
+				shutdown.signal.throwIfAborted();
+				const provider = rawInput.trim();
+				if (!providers.has(provider)) return { kind: 'error', text: '请选择当前配置中的 ACP 提供方。' };
+				const loading = catalog.refresh(provider);
+				ctx.emit?.('llm/models-updated', provider);
+				await loading;
+				await catalog.cache.get(provider)?.pending;
+				const entry = catalog.cache.get(provider);
+				if (entry?.runtimeError?.code === 'AUTH') return { kind: 'error', text: `${providers.get(provider).title}：目录已连接，但最近一次对话认证失败；刷新目录不代表已恢复登录，请先完成 CLI 登录后重试对话。` };
+				return entry?.failed
+					? { kind: 'error', text: `${providers.get(provider).title}：${entry.diagnostic ?? '检测失败，请检查 CLI 路径和登录状态。'}${entry.models ? '已保留上次可用模型。' : '尚未获得可用模型列表。'}` }
+					: { kind: 'success', text: '模型目录已刷新；实际对话能力以发送消息后的结果为准。' };
+			},
+		});
+	});
 	ctx.effect(() => async () => {
 		shutdown.abort();
-		await Promise.allSettled(active);
+		await Promise.allSettled([...active, ...discoveries]);
+		await connections.close();
 		if ((await Promise.allSettled([...Array.from(bindings.keys(), retire), ...retirements.values()])).some((result) => result.status === "rejected")) throw new Error("ACP Hub shutdown could not confirm complete binding cleanup.");
 	}, "acpAgentHub.bindings()");
 }

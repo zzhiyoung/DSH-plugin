@@ -18,6 +18,8 @@ function background() {
   const warnings = []
   const adapters = []
   const ctx = {
+    subprocess: { spawn() {} },
+    sessions: { flush: async () => true },
     logger: { warn(message) { warnings.push(message) } },
     on() {
       return () => {}
@@ -56,17 +58,34 @@ test('the desktop package is launched through --serve so ACP reaches stdio', asy
 
   assert.equal(planned.command, 'node.exe')
   assert.deepEqual(planned.args, [cli, '--serve', '--acp', '--acp-transport', 'stdio', '--port', '0'])
-  assert.deepEqual(planned.env, ['CODEBUDDY_FORCE_LITE_WB_BUNDLE=1'])
+  assert.deepEqual(planned.env, ['CODEBUDDY_FORCE_LITE_WB_BUNDLE=1', 'CODEBUDDY_CREDENTIALS_IN_MEMORY=1'])
   assert.equal(planned.auth, 'internal')
 })
 
-test('a standalone CLI keeps the plain ACP entry and no forced bundle', async (t) => {
+test('a standalone CLI serves stdio ACP on a free port without forced env', async (t) => {
   const cli = await layout(t, ['codebuddy-headless.js'])
 
   const planned = entry.planWorkBuddy(row({ env: ['CODEBUDDY_API_KEY'] }), cli)
 
-  assert.deepEqual(planned.args, [cli, '--acp', '--acp-transport', 'stdio'])
+  assert.deepEqual(planned.args, [cli, '--serve', '--acp', '--acp-transport', 'stdio', '--port', '0'])
   assert.deepEqual(planned.env, ['CODEBUDDY_API_KEY'])
+})
+
+test('a full CLI carrying both bundles gets a free port and keeps file credentials', async (t) => {
+  const cli = await layout(t, ['codebuddy-lite-wb.mjs', 'codebuddy-headless.js'])
+
+  const planned = entry.planWorkBuddy(row(), cli)
+
+  assert.deepEqual(planned.args, [cli, '--serve', '--acp', '--acp-transport', 'stdio', '--port', '0'])
+  assert.deepEqual(planned.env, [])
+  assert.equal(planned.authMode, 'existing')
+})
+
+test('desktop credential isolation preserves an explicit operator override', async (t) => {
+  const cli = await layout(t, ['codebuddy-lite-wb.mjs'])
+  const planned = entry.planWorkBuddy(row({ env: ['CODEBUDDY_CREDENTIALS_IN_MEMORY=0'] }), cli)
+  assert.equal(planned.env.filter((v) => v.startsWith('CODEBUDDY_CREDENTIALS_IN_MEMORY=')).length, 1)
+  assert.ok(planned.env.includes('CODEBUDDY_CREDENTIALS_IN_MEMORY=0'))
 })
 
 test('an executable launcher replaces the Node command', async (t) => {
@@ -122,7 +141,7 @@ test('the entry point registers WorkBuddy when its CLI path is overridden', asyn
   process.env.DSH_ACP_WORKBUDDY = cli
   try {
     const { ctx, adapters } = background()
-    entry.apply(ctx, {
+    entry.apply(ctx, { connectOnStart: false,
       agents: [row()],
       execution: 'released',
       tools: [],
@@ -140,7 +159,7 @@ test('the entry point drops WorkBuddy when no CLI can be found', () => {
   process.env.DSH_ACP_WORKBUDDY = 'C:\\no-such-workbuddy\\cli\\bin\\codebuddy'
   try {
     const { ctx, warnings, adapters } = background()
-    entry.apply(ctx, {
+    entry.apply(ctx, { connectOnStart: false,
       agents: [row(), { id: 'codex', title: 'Codex', command: 'node.exe', args: ['--import', 'x'], env: [] }],
       execution: 'released',
       tools: [],
@@ -172,4 +191,10 @@ test('environment entries pass host values through or pin literals', () => {
   } finally {
     delete process.env.DSH_ACP_TEST_TOKEN
   }
+})
+
+test('WorkBuddy reuses existing credentials unless interactive authentication is explicit', () => {
+  assert.equal(entry.planWorkBuddy(row(), 'codebuddy').authMode, 'existing')
+  assert.equal(entry.planWorkBuddy(row({ authMode: 'authenticate' }), 'codebuddy').authMode, 'authenticate')
+  assert.equal(entry.planWorkBuddy(row({ args: ['--custom'] }), 'codebuddy').authMode, 'existing')
 })

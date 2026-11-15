@@ -1,5 +1,6 @@
 import { Readable, Writable } from 'node:stream'
 import { PROTOCOL_VERSION, RequestError, client, methods, ndJsonStream } from '@agentclientprotocol/sdk'
+import { promptFailure } from './acp-result.js'
 
 /** ACP v1 over a DSH-managed subprocess. */
 /** Race an operation with a deadline, releasing the listener at settlement. */
@@ -57,7 +58,10 @@ export class AcpConnection {
 	constructor(subprocess, command, cwd, cancelGraceMs, mcpTools) {
 		this.cancelGraceMs = cancelGraceMs;
 		this.mcpTools = mcpTools;
-		this.auth = command.auth;
+		this.authMode = command.authMode;
+		this.authMethod = command.auth;
+		this.title = command.title ?? command.id;
+		this.auth = command.authMode === 'existing' ? undefined : command.auth;
 		const env = commandEnvironment(command.env);
 		this.child = subprocess.spawn({
 			argv: [command.command, ...command.args],
@@ -156,38 +160,48 @@ export class AcpConnection {
 			this.child.terminate();
 		}
 	}
-	/** Negotiate v1 and create a fresh remote Session. */
-	async open(cwd, mcp, signal) {
-		const agent = this.connection.agent;
-		let stage = "initialize";
+	/** Initialize once; interactive login is a separate, explicitly requested operation. */
+	async initialize(signal) {
+		if (this.initialized) return;
+		this.stage = 'initialize';
+		const result = await until(() => this.connection.agent.request(methods.agent.initialize, {
+			protocolVersion: PROTOCOL_VERSION, clientCapabilities: {},
+			clientInfo: { name: 'dsh-agent-hub', title: 'DSH Agent Hub', version: '0.8.3' },
+		}), signal);
+		if (result.protocolVersion !== PROTOCOL_VERSION) throw new Error('Unsupported ACP protocol version.');
+		this.imageInput = result.agentCapabilities?.promptCapabilities?.image === true;
+		this.httpMcp = result.agentCapabilities?.mcpCapabilities?.http === true;
+		this.sessionCapabilities = result.agentCapabilities?.sessionCapabilities ?? {};
+		this.authMethods = result.authMethods ?? [];
+		this.initialized = true;
+	}
+	async authenticate(signal, method = this.authMethod) {
+		await this.initialize(signal);
+		const available = this.authMethods.map((m) => m.id);
+		method ??= ['internal', 'qodercli-login', 'qoderclicn-login', 'chat-gpt'].find((id) => available.includes(id));
+		if (!method && available.length === 1) method = available[0];
+		if (!method || (available.length && !available.includes(method))) throw promptFailure({ errorMessage: { code: -32000 } }, this.title);
+		this.stage = 'authenticate';
+		try { await until(() => this.connection.agent.request(methods.agent.authenticate, { methodId: method }), signal); }
+		catch (error) {
+			if (error instanceof RequestError) throw promptFailure({ errorMessage: { code: error.code, message: error.message, data: error.data } }, this.title);
+			throw error;
+		}
+	}
+	/** A new ACP session for each DSH request avoids sharing another conversation's history. */
+	async newSession(cwd, mcp, signal) {
+		await this.initialize(signal);
+		if (mcp !== undefined && !this.httpMcp) throw new Error('This ACP agent does not advertise HTTP MCP.');
 		try {
-			const result = await until(() => agent.request(methods.agent.initialize, {
-				protocolVersion: PROTOCOL_VERSION,
-				clientCapabilities: {},
-				clientInfo: {
-					name: "dsh-agent-hub",
-					title: "DSH Agent Hub",
-					version: "0.2.2-rc.1"
-				}
-			}), signal);
-			this.imageInput = result.agentCapabilities?.promptCapabilities?.image === true;
-			if (result.protocolVersion !== PROTOCOL_VERSION) throw new Error("Unsupported ACP protocol version.");
-			if (this.auth !== void 0) {
-				stage = "authenticate";
-				try {
-					await until(() => agent.request(methods.agent.authenticate, { methodId: this.auth }), signal);
-				} catch (authError) {
-					if (authError instanceof RequestError) throw new Error(`ACP authentication with method ${this.auth} failed with protocol code ${authError.code}. Sign in with the agent CLI.`);
-					throw authError;
-				}
+			if (this.sessionId && this.sessionCapabilities.close) {
+				this.stage = 'session/close';
+				await until(() => this.connection.agent.request('session/close', { sessionId: this.sessionId }), signal);
 			}
-			if (mcp !== void 0 && !result.agentCapabilities?.mcpCapabilities?.http) throw new Error("This ACP agent does not advertise HTTP MCP. Remove the DSH tool allowlist or use an HTTP-capable agent.");
-			stage = "session/new";
-			const session = await until(() => agent.request(methods.agent.session.new, {
-				cwd,
-				mcpServers: mcp === void 0 ? [] : [mcp]
-			}), signal);
-			if (typeof session.sessionId !== "string" || session.sessionId === "") throw new Error("ACP returned an empty session id.");
+			this.sessionId = undefined;
+			this.model = undefined;
+			this.stage = 'session/new';
+			const session = await until(() => this.connection.agent.request(methods.agent.session.new, { cwd, mcpServers: mcp === undefined ? [] : [mcp] }), signal);
+			if (typeof session.sessionId !== 'string' || !session.sessionId) throw new Error('ACP returned an empty session id.');
 			this.sessionId = session.sessionId;
 			this.mcpName = mcp?.name;
 			this.model = modelConfig(session.configOptions);
@@ -195,10 +209,14 @@ export class AcpConnection {
 			this.permissionConfig = session.configOptions?.find((o) => o.type === 'select' && (o.category === 'mode' || o.id === 'mode'));
 			this.modes = session.modes;
 		} catch (error) {
-			if (error instanceof RequestError && error.code === -32e3) throw new Error("ACP authentication is required. Sign in with the configured agent CLI and retry.");
-			if (error instanceof RequestError) throw new Error(`ACP ${stage} failed with protocol code ${error.code}.`);
+			if (error instanceof RequestError) throw promptFailure({ errorMessage: { code: error.code, message: error.message, data: error.data } }, this.title);
 			throw error;
 		}
+	}
+	async open(cwd, mcp, signal) {
+		await this.initialize(signal);
+		if (this.auth !== undefined) await this.authenticate(signal, this.auth);
+		await this.newSession(cwd, mcp, signal);
 	}
 	/** Return the models advertised for this ACP Session. */
 	get models() {
@@ -258,6 +276,7 @@ export class AcpConnection {
 		this.output = onText;
 		this.thought = onThought;
 		this.outputError = void 0;
+		this.stage = 'session/prompt';
 		const pending = agent.request(methods.agent.session.prompt, {
 			sessionId,
 			prompt
@@ -265,6 +284,8 @@ export class AcpConnection {
 		try {
 			const result = await until(() => pending, signal);
 			if (this.outputError !== void 0) throw this.outputError;
+			const failure = promptFailure(result, this.title);
+			if (failure) throw failure;
 			return result.stopReason;
 		} catch (error) {
 			if (signal.aborted && !this.closed) {
@@ -274,7 +295,7 @@ export class AcpConnection {
 				} catch (_error) {}
 			}
 			if (this.outputError !== void 0) throw this.outputError;
-			if (error instanceof RequestError) throw new Error(`ACP session/prompt failed with protocol code ${error.code}.`);
+			if (error instanceof RequestError) throw promptFailure({ errorMessage: { code: error.code, message: error.message, data: error.data } }, this.title);
 			throw error;
 		} finally {
 			this.permission = void 0;
