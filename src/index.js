@@ -38,7 +38,7 @@ const Config = z.object({
 	toolApproval: z.union([z.const('rules'), z.const('ask')]).default('rules').volatile().description('DSH 工具按现有权限规则处理，或每次都询问'),
 	nativeApproval: z.union([z.const('dsh'), z.const('agent'), z.const('deny')]).default('dsh').volatile().description('原生工具：DSH 确认 / 跟随外部 agent 权限模式 / 拒绝 ACP 审批'),
 	permissionMode: z.string().default('').volatile().description('外部 agent 权限模式 ID；留空沿用当前模式；例如 Codex 的 agent 是 Auto review，不是全量放行'),
-	startupMs: z.natural().max(12e4).default(0),
+	startupMs: z.natural().max(12e4).default(60000).description('对话开始后，握手、建会话和模型/权限选择共用的等待上限（毫秒）；0 表示不限时'),
 	connectOnStart: z.boolean().default(true).description('插件启动后自动连接各 agent 一次；不自动登录'),
 	loginMs: z.natural().min(1000).max(600000).default(180000).description('手动刷新发起登录的最长等待毫秒'),
 	discoveryMs: z.natural().min(1).max(12e4).default(60000).description('后台模型目录探测截止毫秒；独立于对话运行时间，冷启动可能超过 15 秒'),
@@ -49,7 +49,7 @@ const Config = z.object({
 	cancelGraceMs: z.natural().min(1).max(3e4).default(5e3),
 	idleMs: z.natural().min(1).max(36e5).default(9e5),
 	maxBindings: z.natural().min(1).max(100).default(8),
-	maxContextBytes: z.natural().min(1024).max(1024 * 1024).default(128 * 1024),
+	maxContextBytes: z.natural().max(Number.MAX_SAFE_INTEGER).default(128 * 1024).description('单轮文字上下文的 UTF-8 字节上限，旧历史按预算保留；0 表示不限制文字字节数'),
 	maxOutputBytes: z.natural().min(1024).max(1024 * 1024).default(256 * 1024),
 	showThoughts: z.boolean().default(true)
 });
@@ -159,11 +159,7 @@ function apply(ctx, config) {
 				if (event?.type === "tool/result" && event.data.message.toolCallId.startsWith("acp-hub-")) shared.add(event.data.message.toolCallId);
 			}
 			if (binding) clearTimeout(binding.idle);
-			const prompt = await projectPrompt(input, binding?.coveredTo, shared, turnBridge?.hasSkill ?? schemas.some((schema) => schema.name === "skill"), config, ctx.get('attachments'), signal);
-			if (turnBridge) {
-				prompt[0].text += '\n' + toolGuide(turnBridge.guide);
-				if (Buffer.byteLength(prompt[0].text) > config.maxContextBytes) throw new Error('ACP context including the DSH tool guide exceeds the configured byte limit.');
-			}
+			const startup = config.startupMs > 0 ? AbortSignal.any([signal, AbortSignal.timeout(config.startupMs)]) : signal;
 			if (binding === void 0) {
 				if (bindings.size + retirements.size >= config.maxBindings) throw new Error("ACP Hub has reached its connection limit. Close an active conversation or wait for an idle binding to expire.");
 				const gateway = schemas.length === 0 ? void 0 : new Gateway(ctx, schemas, gated, config.maxImageBytes);
@@ -182,12 +178,16 @@ function apply(ctx, config) {
 				};
 				bindings.set(agent, binding);
 				const mcp = await gateway?.listen();
-				await connection.open(cwd, mcp, AbortSignal.any([signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]));
+				await connection.open(cwd, mcp, startup);
 			}
 			clearTimeout(binding.idle);
-			await binding.connection.selectModel(model, AbortSignal.any([signal, ...(config.startupMs > 0 ? [AbortSignal.timeout(config.startupMs)] : [])]));
+			await binding.connection.selectModel(model, startup);
 			catalog.acceptConnection(legacy ? PROVIDER_PREFIX + command.id : selection.provider, { models: binding.connection.models, imageInput: binding.connection.imageInput });
-			if (config.nativeApproval === 'agent') await binding.connection.selectPermissionMode(config.permissionMode || command.permissionMode, signal);
+			if (config.nativeApproval === 'agent') await binding.connection.selectPermissionMode(config.permissionMode || command.permissionMode, startup);
+			const prompt = await projectPrompt(input, binding.coveredTo, shared, !!binding.gateway && (turnBridge?.hasSkill ?? schemas.some((schema) => schema.name === 'skill')), config, ctx.get('attachments'), signal, {
+				guide: binding.gateway && turnBridge ? toolGuide : undefined,
+				imageInput: binding.connection.imageInput,
+			});
 			const prepared = appendPluginRecord(session, DELIVERY_RECORD, {
 				phase: "prepared",
 				turn,
@@ -203,7 +203,9 @@ function apply(ctx, config) {
 				toolSet: turnBridge?.toolSet ?? input.toolSet,
 				...(turnBridge ? { refreshTools: async () => {
 					const next = await turnBridge.refresh();
-					binding.gateway.active.input.toolSet = turnBridge.toolSet;
+					const active = binding.gateway.active;
+					if (!active || active.input.signal !== signal) return;
+					active.input.toolSet = turnBridge.toolSet;
 					binding.gateway.setTools(next);
 				} } : {}),
 			});
@@ -286,7 +288,7 @@ function apply(ctx, config) {
 			throw error;
 		}
 	};
-	const contextWindow = config.execution === "released" ? RELEASED_HOST_HEADROOM_TOKENS + Math.max(16384, Math.floor(config.maxContextBytes / 4)) : void 0;
+	const contextWindow = config.execution === "released" ? RELEASED_HOST_HEADROOM_TOKENS + Math.max(16384, Math.floor((config.maxContextBytes || 128 * 1024) / 4)) : void 0;
 	const connections = new AgentConnections(ctx, config, shutdown.signal, (id, phase) => catalog.setPhase(PROVIDER_PREFIX + id, phase));
 	const catalog = new Catalog(providers, (command, options) => {
 		const work = discover(command, options).finally(() => {

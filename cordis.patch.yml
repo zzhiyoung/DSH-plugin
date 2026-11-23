@@ -6,7 +6,7 @@
         toolSource: dsh
         toolApproval: rules
         nativeApproval: dsh
-        startupMs: 0
+        startupMs: 60000
         connectOnStart: true
         loginMs: 180000
         agents:

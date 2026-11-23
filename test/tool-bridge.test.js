@@ -95,8 +95,39 @@ test('gateway propagates cancellation to a pending DSH tool before closing', asy
   const g = new Gateway(ctx, [{ name: 'read', parameters: {} }], new Set())
   g.begin({ agent: { session: {} }, signal: new AbortController().signal, recordToolCall() {} })
   const pending = g.call(g.active, 'read', {}, 1, new AbortController().signal)
+  const queued = g.call(g.active, 'read', {}, 2, new AbortController().signal)
   await ready
   await g.close()
   assert.equal(cancelled, true)
   assert.equal((await pending).isError, true)
+  assert.match((await queued).content[0].text, /cancelled/)
+})
+
+test('parallel MCP requests execute in order and checkpoint each tool result once', async () => {
+  const first = Promise.withResolvers(), started = Promise.withResolvers()
+  const executions = []
+  let flushes = 0
+  const ctx = {
+    agents: { withInitiator: (_, fn) => fn() }, sessions: { flush: async () => { flushes++; return true } },
+    tools: { async execute({ calls }) {
+      const { order } = JSON.parse(calls[0].arguments)
+      executions.push(order)
+      if (order === 1) { started.resolve(); await first.promise }
+      return { results: [{ result: { content: [{ type: 'text', text: 'ok' }] } }], additionalContexts: [] }
+    } },
+  }
+  const g = new Gateway(ctx, [{ name: 'read', parameters: {} }], new Set())
+  const signal = new AbortController().signal
+  g.begin({ agent: { session: {} }, signal, recordToolCall() {} })
+  const a = g.call(g.active, 'read', { order: 1 }, 1, signal)
+  const b = g.call(g.active, 'read', { order: 2 }, 2, signal)
+  assert.equal((await g.call(g.active, 'read', { order: 3 }, 2, signal)).isError, true)
+  await started.promise
+  assert.deepEqual(executions, [1])
+  first.resolve()
+  assert.ok((await Promise.all([a, b])).every((result) => result.content[0].text === 'ok'))
+  assert.deepEqual(executions, [1, 2])
+  assert.equal(flushes, 2)
+  assert.equal(await g.end(), true)
+  await g.close()
 })

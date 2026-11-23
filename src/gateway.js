@@ -83,7 +83,9 @@ export class Gateway {
 		this.active = {
 			input,
 			abort: new AbortController(),
-			ids: /* @__PURE__ */ new Set()
+			ids: new Set(),
+			pending: 0,
+			tail: Promise.resolve(),
 		};
 	}
 	/** Reject new calls, abort a pending tool or approval, and await executor settlement. */
@@ -91,10 +93,10 @@ export class Gateway {
 		const active = this.active;
 		this.active = void 0;
 		if (active === void 0) return true;
-		const inFlight = active.work;
+		const unfinished = active.pending > 0;
 		active.abort.abort();
-		await inFlight;
-		return inFlight === void 0 && !active.failed;
+		await active.tail;
+		return !unfinished && !active.failed;
 	}
 	/** Revoke the lease before awaiting outstanding executor work. */
 	async close() {
@@ -137,7 +139,7 @@ export class Gateway {
 			version: "0.2.2-rc.1"
 		}, { capabilities: { tools: {} } });
 		server.setRequestHandler(ListToolsRequestSchema, async () => {
-			if (admission && this.active === admission && !admission.work) await admission.input.refreshTools?.();
+			if (admission && this.active === admission && admission.pending === 0) await admission.input.refreshTools?.();
 			return { tools: this.tools };
 		});
 		server.setRequestHandler(CallToolRequestSchema, ({ params }, extra) => this.call(admission, params.name, params.arguments ?? {}, extra.requestId, extra.signal));
@@ -158,16 +160,15 @@ export class Gateway {
 			active.abort.signal,
 			clientSignal
 		]);
-		if (signal.aborted) return toolError("The DSH tool request was cancelled.");
-		if (active.work !== void 0 || ids.has(requestId) || ids.size >= 64) return toolError("DSH tool request is busy, repeated, or over the turn limit.");
+		if (signal.aborted || active.failed) return toolError("The DSH tool request was cancelled.");
+		if (ids.has(requestId) || ids.size >= 64) return toolError("DSH tool request is repeated or over the turn limit.");
 		ids.add(requestId);
-		const work = this.execute(active, name, args, signal);
-		active.work = work;
-		try {
-			return await work;
-		} finally {
-			delete active.work;
-		}
+		active.pending++;
+		const work = active.tail.then(() => signal.aborted
+			? toolError("The DSH tool request was cancelled.")
+			: this.execute(active, name, args, signal)).finally(() => { active.pending--; });
+		active.tail = work.catch(() => {});
+		return work;
 	}
 	async execute(active, name, args, signal) {
 		const { input } = active;
@@ -181,6 +182,7 @@ export class Gateway {
 		this.gated.add(id);
 		try {
 			await input.refreshTools?.();
+			if (signal.aborted) return toolError("The DSH tool request was cancelled.");
 			if (!this.names.has(name)) return toolError("This DSH tool is no longer available.");
 			input.recordToolCall(call);
 			const result = await this.ctx.agents.withInitiator(input.agent, () => this.ctx.tools.execute({
@@ -193,8 +195,10 @@ export class Gateway {
 				},
 				calls: [call]
 			}));
-			// Checkpoint the DSH outcome before converting or bounding an external response.
+			for (const context of result.additionalContexts) input.agent.session.append("user/message", context, { surfaceOp: "append" });
+			// Checkpoint the DSH outcome and its additional contexts before formatting the reply.
 			if (!await this.ctx.sessions.flush(input.agent.session)) throw new Error('DSH tool outcome could not be checkpointed.');
+			if (result.concluded) active.failed = true;
 			const item = result.results[0]?.result;
 			if (item === void 0) return toolError("DSH did not report a tool result.");
 			const content = [];
@@ -210,16 +214,10 @@ export class Gateway {
 				} else content.push({ type: 'text', text: `[DSH tool returned unsupported content: ${block.type}]` });
 			}
 			for (const context of result.additionalContexts) {
-				input.agent.session.append("user/message", context, { surfaceOp: "append" });
 				for (const block of context.content) if (block.type === "text") content.push({
 					type: "text",
 					text: block.text
 				});
-			}
-			if (!await this.ctx.sessions.flush(input.agent.session)) throw new Error("DSH tool result could not be checkpointed.");
-			if (result.concluded) {
-				active.failed = true;
-				active.abort.abort();
 			}
 			return Buffer.byteLength(JSON.stringify(content.filter((b) => b.type !== 'image'))) > 128 * 1024 ? toolError("DSH tool output exceeds the ACP transfer limit. Read a smaller result.") : {
 				isError: item.isError,
@@ -227,9 +225,9 @@ export class Gateway {
 			};
 		} catch (_error) {
 			active.failed = true;
-			active.abort.abort();
 			return toolError("DSH tool execution did not settle normally. Check the DSH transcript before retrying.");
 		} finally {
+			if (active.failed) active.abort.abort();
 			this.gated.delete(id);
 		}
 	}

@@ -12,27 +12,36 @@ export class AgentConnections {
   run(command, signal, task) {
     let entry = this.entries.get(command.id);
     if (!entry) { entry = { tail: Promise.resolve() }; this.entries.set(command.id, entry); }
+    let started = false;
     const work = entry.tail.then(async () => {
       this.signal.throwIfAborted(); signal?.throwIfAborted();
+      started = true;
       return task(entry);
     });
     entry.tail = work.catch(() => {});
     if (!signal) return work;
     let cancel;
     const aborted = new Promise((_, reject) => {
-      cancel = () => reject(signal.reason);
+      cancel = () => { if (!started) reject(signal.reason); };
       signal.addEventListener('abort', cancel, { once: true });
       if (signal.aborted) cancel();
     });
     return Promise.race([work, aborted]).finally(() => signal.removeEventListener('abort', cancel));
   }
-  async discard(entry) {
+  async discard(entry, preserveError = false) {
     const connection = entry.connection;
     entry.connection = undefined;
-    try { await connection?.close(); }
-    finally {
-      if (entry.cwd && dirname(entry.cwd) === entry.temp) await rm(entry.cwd, { recursive: true, force: true });
-      entry.cwd = undefined;
+    try {
+      try { await connection?.close(); }
+      finally {
+        if (entry.cwd && dirname(entry.cwd) === entry.temp) {
+          await rm(entry.cwd, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 });
+        }
+        entry.cwd = undefined;
+      }
+    } catch (error) {
+      if (!preserveError) throw error;
+      this.ctx.logger?.warn?.('[dsh-acp-agent-hub] ACP connection cleanup failed after a request error.');
     }
   }
   async ensure(entry, command, signal) {
@@ -44,7 +53,11 @@ export class AgentConnections {
       entry.connection = new AcpConnection(this.ctx.subprocess, { ...command, authMode: 'existing' }, entry.cwd, this.config.cancelGraceMs ?? 5000, new Set());
       await entry.connection.initialize(signal);
       return entry.connection;
-    } catch (error) { error.acpStage = entry.connection?.stage; await this.discard(entry); throw error; }
+    } catch (error) {
+      if (error instanceof Error) error.acpStage ??= entry.connection?.stage ?? 'spawn';
+      await this.discard(entry, true);
+      throw error;
+    }
   }
   async inspect(command, { interactive = false, verify = false } = {}) {
     return this.run(command, undefined, async (entry) => {
@@ -76,9 +89,11 @@ export class AgentConnections {
           return await check();
         }
       } catch (error) {
-        error.acpStage = connection.stage;
-        if (directory && error instanceof Error) error.catalog = directory;
-        if (error?.name === 'TimeoutError') await this.discard(entry);
+        if (error instanceof Error) {
+          error.acpStage ??= connection.stage;
+          if (directory) error.catalog = directory;
+        }
+        if (error?.name === 'TimeoutError' || !connection.available || this.signal.aborted) await this.discard(entry, true);
         throw error;
       }
     });
@@ -87,13 +102,36 @@ export class AgentConnections {
   async use(command, { cwd, mcp, mcpTools, signal }, task) {
     return this.run(command, signal, async (entry) => {
       const startup = this.config.startupMs > 0 ? this.deadline(this.config.startupMs, signal) : AbortSignal.any([this.signal, signal]);
-      const connection = await this.ensure(entry, command, startup);
-      connection.mcpTools = mcpTools;
+      const reused = entry.connection?.available === true;
+      let connection;
+      let setupComplete = false;
       try {
-        await connection.newSession(cwd, mcp, startup);
-        return await task(connection);
-      } finally {
-        if (signal.aborted || !connection.available || connection.outputError) await this.discard(entry);
+        connection = await this.ensure(entry, command, startup);
+        connection.mcpTools = mcpTools;
+        try {
+          await connection.newSession(cwd, mcp, startup);
+        } catch (error) {
+          // A retained process can exit between the health check and the first RPC.
+          // Recover only while setting up the session, before sending a user prompt.
+          if (!reused || error?.code !== 'ACP_TRANSPORT' || startup.aborted) throw error;
+          await this.discard(entry, true);
+          connection = await this.ensure(entry, command, startup);
+          connection.mcpTools = mcpTools;
+          await connection.newSession(cwd, mcp, startup);
+        }
+        setupComplete = true;
+        const result = await task(connection, startup);
+        if (signal.aborted || !connection.available) await this.discard(entry);
+        return result;
+      } catch (error) {
+        const stage = error?.acpStage ?? connection?.stage;
+        const timedOut = startup.aborted && !signal.aborted && !this.signal.aborted && error === startup.reason;
+        if (signal.aborted || this.signal.aborted || timedOut || connection?.available === false) await this.discard(entry, true);
+        if (timedOut) {
+          throw Object.assign(new Error(`ACP startup timed out during ${stage ?? 'setup'}.`), { name: 'TimeoutError', acpStage: stage });
+        }
+        if (!setupComplete && error instanceof Error) error.acpStage ??= stage;
+        throw error;
       }
     });
   }

@@ -2,6 +2,7 @@ import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
 
 /** A scoped, renewable admission owned by one released ACP turn. */
 export class DshTools {
+	disposed = false;
 	constructor(ctx, agent, config, selection, signal) {
 		Object.assign(this, { ctx, agent, config, selection, signal });
 	}
@@ -12,24 +13,30 @@ export class DshTools {
 	}
 	async update() {
 		this.signal.throwIfAborted();
+		if (this.disposed) throw new Error('DSH tool admission has closed.');
 		const admission = await this.ctx.tools.resolve({ agent: this.agent, modelSelection: this.selection, signal: this.signal });
 		const allow = new Set(this.config.tools);
 		const toolSet = { view: (scope) => new Map([...admission.view(scope)].filter(([name]) => allow.size === 0 || allow.has(name))) };
 		try {
+			if (this.disposed) throw new Error('DSH tool admission has closed.');
 			const definitions = this.ctx.tools.definitions(this.agent, toolSet);
 			const executor = this.ctx.tools.selectExecutor(this.agent);
-			let schemas = executor.describe(definitions).schemas;
+			let schemas = definitions.length ? executor.describe(definitions).schemas : [];
 			// PTC exposes run_code; its SDK describes the admitted nested DSH/MCP tools.
-			const guide = typeof executor.renderSdk === 'function' ? executor.renderSdk(definitions) : '';
+			const guide = schemas.length && typeof executor.renderSdk === 'function' ? executor.renderSdk(definitions) : '';
 			if (guide) schemas = schemas.map((s) => ({ ...s, description: s.description + '\n' + guide }));
 			const hasSkill = definitions.some((d) => d.name === 'skill');
 			this.signal.throwIfAborted();
 			this.admission?.dispose();
-			Object.assign(this, { admission, toolSet, schemas, guide, hasSkill });
+			Object.assign(this, { admission, toolSet, schemas, hasSkill });
 			return schemas;
 		} catch (error) { admission.dispose(); throw error; }
 	}
-	dispose() { this.admission?.dispose(); }
+	dispose() {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.admission?.dispose();
+	}
 }
 
 /** Record requests separately from the outer assistant stream, avoiding re-execution by AgentLoop. */
@@ -47,6 +54,4 @@ export function recordDshCall(session, position, selection, call) {
 	}, { surfaceOp: 'append' });
 }
 
-export function toolGuide(guide) {
-	return 'Use the dsh MCP server for tools, including configured MCP services and the skill loader. Prefer these tools to your own built-in tools. Follow DSH permission decisions; do not retry a denied DSH operation using another tool. Refresh tools/list after loading a skill to discover newly admitted tools.\n' + guide;
-}
+export const toolGuide = 'Use the dsh MCP server for tools, including configured MCP services and the skill loader. Prefer these tools to your own built-in tools. Follow DSH permission decisions; do not retry a denied DSH operation using another tool. Refresh tools/list after loading a skill. For run_code, use the SDK documented in the tool description.';

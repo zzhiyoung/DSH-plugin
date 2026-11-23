@@ -9,6 +9,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   if (method === 'authenticate') authenticated = true
   if (method === 'session/new') result = { sessionId: 's-' + ++sessions }
   if (method === 'session/prompt') {
+    if (process.argv.includes('--exit-on-prompt')) process.exit(1)
     if (!authenticated) result = { stopReason: 'refusal', _meta: { 'codebuddy.ai/errorMessage': JSON.stringify({ code: -32000, message: 'Authentication required' }) } }
     else {
       send({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OK' } } } })
