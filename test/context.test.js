@@ -115,6 +115,96 @@ test('durable current and historical images are sent with association and verifi
   assert.match(prompt[0].text, /Image 1, message 2/)
   assert.match(prompt[0].text, /Image 2, message 1/)
   assert.equal((await projectPrompt(turn, 2, new Set(), false, cfg, attachments, signal)).length, 2)
-  await assert.rejects(projectPrompt(turn, undefined, new Set(), false, { ...cfg, maxImageBytes: 5 }, attachments, signal), /byte limit/)
+  const limited = await projectPrompt(turn, undefined, new Set(), false, { ...cfg, maxImageBytes: 5 }, attachments, signal)
+  assert.equal(limited.length, 2)
+  assert.match(limited[0].text, /Image omitted/)
+  await assert.rejects(projectPrompt(turn, undefined, new Set(), false, { ...cfg, maxImageBytes: 2 }, attachments, signal), /byte limit/)
   await assert.rejects(projectPrompt(turn, undefined, new Set(), false, cfg, undefined, signal), /storage is unavailable/)
+})
+
+test('keeps recent UTF-8 history and current input within the same budget as the tool guide', async () => {
+  const earlier = message(1, 'user', '"\\旧'.repeat(600))
+  earlier.content.push({ type: 'image', attachment: { bytes: 3, mediaType: 'image/png' } })
+  const recent = message(2, 'assistant', '最近一条回复')
+  const current = message(3, 'user', '继续')
+  const inputs = [{ seq: 3, message: current }]
+  const turn = (rows) => ({ agent: { session: sessionOf(rows) }, inputs })
+  const latest = [{ seq: 2, message: recent }, ...inputs]
+  const all = turn([{ seq: 1, message: earlier }, ...latest])
+  const guide = '工具指南'
+  const text = projectContext(turn(latest), undefined, new Set(), false, 0)
+  const maxContextBytes = Buffer.byteLength(text + '\n' + guide)
+  const signal = new AbortController().signal
+  let attachmentReads = 0
+  const attachments = { readImage: async () => { attachmentReads++ } }
+  const [block] = await projectPrompt(all, undefined, new Set(), false, { maxContextBytes, maxImageBytes: 6 }, attachments, signal, { guide })
+  assert.equal(attachmentReads, 0)
+
+  assert.equal(block.text, text + '\n' + guide)
+  assert.equal(payload(projectContext(all, undefined, new Set(), false, 0)).history.length, 2)
+})
+
+test('outdated images cannot consume current image budget or block text-only agents', async () => {
+  const earlier = message(1, 'user', 'earlier')
+  const recent = message(2, 'user', 'recent')
+  const current = message(3, 'user', 'now')
+  const imageBlock = (id) => ({ type: 'image', attachment: { id, bytes: 3, mediaType: 'image/png' } })
+  earlier.content.push(imageBlock(1))
+  recent.content.push(imageBlock(2))
+  current.content.push(imageBlock(3))
+  const turn = {
+    agent: { session: sessionOf([{ seq: 1, message: earlier }, { seq: 2, message: recent }, { seq: 3, message: current }]) },
+    inputs: [{ seq: 3, message: current }],
+  }
+  const seen = []
+  const attachments = {
+    readImage: async (ref) => {
+      seen.push(ref.id)
+      if (ref.id === 1) throw new Error('Old attachment has disappeared')
+      return { ref, data: new Uint8Array(3).fill(ref.id) }
+    },
+  }
+  const signal = new AbortController().signal
+  const config = { maxContextBytes: 4096, maxImageBytes: 6 }
+  const prompt = await projectPrompt(turn, undefined, new Set(), false, config, attachments, signal)
+  assert.deepEqual(seen, [3, 2])
+  assert.deepEqual(prompt.slice(1).map(({ data }) => data), ['AwMD', 'AgIC'])
+  assert.match(payload(prompt[0].text).history[0].text, /Image omitted/)
+  assert.match(payload(prompt[0].text).history[1].text, /Image 2, message 2/)
+
+  const missing = await projectPrompt(turn, undefined, new Set(), false, { ...config, maxImageBytes: 9 }, attachments, signal)
+  assert.deepEqual(seen, [3, 2, 3, 2, 1])
+  assert.equal(missing.length, 3)
+  assert.match(payload(missing[0].text).history[0].text, /Image omitted/)
+
+  await assert.rejects(projectPrompt(turn, undefined, new Set(), false, config, attachments, signal, { imageInput: false }), /does not advertise image/)
+  current.content.pop()
+  const textOnly = await projectPrompt(turn, undefined, new Set(), false, config, attachments, signal, { imageInput: false })
+  assert.equal(textOnly.length, 1)
+  assert.match(payload(textOnly[0].text).history[1].text, /Image omitted/)
+  assert.deepEqual(seen, [3, 2, 3, 2, 1])
+})
+
+test('enforces actual image bytes and propagates cancellation from a historical read', async () => {
+  const earlier = message(1, 'user', 'before')
+  const current = message(2, 'user', 'now')
+  const ref = { bytes: 1, mediaType: 'image/png' }
+  earlier.content.push({ type: 'image', attachment: ref })
+  current.content.push({ type: 'image', attachment: ref })
+  const turn = {
+    agent: { session: sessionOf([{ seq: 1, message: earlier }, { seq: 2, message: current }]) },
+    inputs: [{ seq: 2, message: current }],
+  }
+  const config = { maxContextBytes: 4096, maxImageBytes: 2 }
+  const signal = new AbortController().signal
+  const attachments = { readImage: async () => ({ ref, data: new Uint8Array(3) }) }
+  await assert.rejects(projectPrompt(turn, undefined, new Set(), false, config, attachments, signal), /byte limit/)
+
+  current.content.pop()
+  const [block] = await projectPrompt(turn, undefined, new Set(), false, config, attachments, signal)
+  assert.match(payload(block.text).history[0].text, /Image omitted/)
+
+  const controller = new AbortController()
+  const cancelled = { readImage: async () => { controller.abort(); return { ref, data: new Uint8Array(1) } } }
+  await assert.rejects(projectPrompt(turn, undefined, new Set(), false, config, cancelled, controller.signal), { name: 'AbortError' })
 })

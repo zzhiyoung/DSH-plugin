@@ -3,28 +3,33 @@ import { register } from 'node:module'
 import { PassThrough } from 'node:stream'
 import { test } from 'node:test'
 register(new URL('./support/hooks.mjs', import.meta.url).href)
-const { setClientFactory } = await import('@agentclientprotocol/sdk')
+const { RequestError, setClientFactory } = await import('@agentclientprotocol/sdk')
 const { AcpConnection } = await import('../src/connection.js')
 const { permissionHandler } = await import('../src/approval.js')
 const { streamReleasedTurn } = await import('../src/released.js')
 
-function harness({ image = true, newSession = async () => ({ sessionId: 's1' }), run = async () => ({ stopReason: 'end_turn' }) } = {}) {
+function harness({ image = true, sessionCapabilities, newSession = async () => ({ sessionId: 's1' }), run = async () => ({ stopReason: 'end_turn' }) } = {}) {
   const handlers = new Map(), calls = []
+  const childExit = Promise.withResolvers()
   const agent = { async request(method, params) {
     calls.push({ method, params })
-    if (method === 'initialize') return { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image }, mcpCapabilities: { http: true } } }
+    if (method === 'initialize') return { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image }, mcpCapabilities: { http: true }, sessionCapabilities } }
     if (method === 'session/new') return newSession(params)
-    return run(handlers, params)
+    return run(handlers, params, method)
   }, notify: async () => {} }
   setClientFactory(() => ({
-    onNotification() { return this },
+    onNotification(method, handler) { handlers.set(method, handler); return this },
     onRequest(method, handler) { handlers.set(method, handler); return this },
     connect() { return { agent, closed: new Promise(() => {}), close() {} } },
   }))
   let terminated = false
-  const subprocess = { spawn: () => ({ stdin: new PassThrough(), stdout: new PassThrough(), done: new Promise(() => {}), terminate() { terminated = true }, waitForExit: async () => true }) }
+  const subprocess = { spawn: () => ({ stdin: new PassThrough(), stdout: new PassThrough(), done: childExit.promise, terminate() { terminated = true }, waitForExit: async () => true }) }
   const command = { id: 'fake', title: 'Fake', command: 'fake', args: [], env: [] }
-  return { calls, subprocess, command, get terminated() { return terminated }, connection: new AcpConnection(subprocess, command, process.cwd(), 10, new Set()) }
+  return { calls, subprocess, command, childExit, get terminated() { return terminated }, connection: new AcpConnection(subprocess, command, process.cwd(), 10, new Set()) }
+}
+async function textReply(handlers, { sessionId }) {
+  await handlers.get('session/update')({ params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OK' } } } })
+  return { stopReason: 'end_turn' }
 }
 const permission = { sessionId: 's1', toolCall: { toolCallId: 't1', title: 'write file', rawInput: { path: 'a.txt' } }, options: [{ kind: 'allow_once', optionId: 'a' }, { kind: 'reject_once', optionId: 'r' }] }
 for (const outcome of ['allowed-once', 'rejected', 'unavailable', 'cancelled', 'unexpected']) {
@@ -61,7 +66,7 @@ test('ACP image capability gates actual image prompts', async () => {
   }
 })
 test('released turn ignores legacy prompt deadline but honors user cancellation', async () => {
-  const h = harness({ run: async () => { await new Promise((r) => setTimeout(r, 30)); return { stopReason: 'end_turn' } } })
+  const h = harness({ run: async (handlers, params) => { await new Promise((r) => setTimeout(r, 30)); return textReply(handlers, params) } })
   const message = { id: 'm', source: { kind: 'user' }, role: 'user', content: [{ type: 'text', text: 'hello' }] }
   const session = { id: 's', seq: 1, header: { cwd: process.cwd() }, surface: { nodes: [0] }, eventAt: () => ({ type: 'user/message', data: message }), deriveEventMessage: (e) => e.data }
   const agent = { session }, active = new Set()
@@ -71,6 +76,7 @@ test('released turn ignores legacy prompt deadline but honors user cancellation'
   const results = []
   for await (const item of streamReleasedTurn(ctx, cfg, h.command, request, new AbortController().signal, active)) results.push(item)
   assert.equal(results.at(-1).type, 'finish')
+  assert.equal(results.at(-1).reason.kind, 'stop')
   assert.equal(active.size, 0)
   const abort = new AbortController(); abort.abort(new Error('user cancelled'))
   await assert.rejects(async () => { for await (const item of streamReleasedTurn(ctx, cfg, h.command, { ...request, signal: abort.signal }, new AbortController().signal, active)) {} }, /user cancelled/)
@@ -95,7 +101,7 @@ test('driver has no legacy prompt deadline and catalog preserves advertised imag
 test('pending discovery does not consume the released conversation limit', async () => {
   const { apply } = await import('../src/index.js')
   const pending = Promise.withResolvers()
-  const h = harness({ newSession: (params) => params.cwd.includes('dsh-acp-slow-') ? pending.promise : { sessionId: 's1' } })
+  const h = harness({ newSession: (params) => params.cwd.includes('dsh-acp-slow-') ? pending.promise : { sessionId: 's1' }, run: textReply })
   let stream, catalog, dispose
   const message = { id: 'm', source: { kind: 'user' }, role: 'user', content: [{ type: 'text', text: 'hello' }] }
   const session = { id: 's', seq: 1, header: { cwd: process.cwd() }, surface: { nodes: [0] }, eventAt: () => ({ type: 'user/message', data: message }), deriveEventMessage: (e) => e.data }
@@ -112,6 +118,7 @@ test('pending discovery does not consume the released conversation limit', async
     const chunks = []
     for await (const chunk of stream({ sessionId: 's', provider: 'acp-fake', model: '@default' }, () => {})) chunks.push(chunk)
     assert.equal(chunks.at(-1).type, 'finish')
+    assert.equal(chunks.at(-1).reason.kind, 'stop')
     assert.ok(catalog.cache.get('acp-slow').pending)
   } finally {
     pending.resolve({ sessionId: 'discovery' })
@@ -127,10 +134,38 @@ test('native approval never selects allow_always and discards approval after can
     const h = harness({ run: async (handlers) => { answer = await handlers.get('session/request_permission')({ params }); return { stopReason: 'end_turn' } } })
     await h.connection.open(process.cwd(), undefined, controller.signal)
     const work = h.connection.prompt('hi', { signal: controller.signal, onPermission: async () => { if (cancel) controller.abort(new Error('cancelled')); return 'allowed-once' } })
-    if (cancel) { await assert.rejects(work, /cancelled/); assert.equal(answer.outcome.optionId, 'r') }
+    if (cancel) { await assert.rejects(work, /cancelled/); assert.equal(answer.outcome.outcome, 'cancelled') }
     else { await work; assert.equal(answer.outcome.outcome, 'cancelled') }
     await h.connection.close()
   }
+})
+
+test('a subprocess exit ends an in-flight prompt even when the protocol transport stays open', async () => {
+  const requested = Promise.withResolvers()
+  const h = harness({ run: () => { requested.resolve(); return new Promise(() => {}) } })
+  const signal = new AbortController().signal
+  await h.connection.open(process.cwd(), undefined, signal)
+  const work = h.connection.prompt('hi', { signal })
+  await requested.promise
+  h.childExit.reject(new Error('upstream details should be redacted'))
+  await assert.rejects(work, (error) => error.code === 'ACP_TRANSPORT' && error.acpStage === 'session/prompt' && error.message === 'ACP subprocess failed.')
+  assert.equal(h.connection.available, false)
+  assert.equal(h.calls.filter(({ method }) => method === 'session/prompt').length, 1)
+  await h.connection.close()
+})
+
+for (const code of [-32002, -32601]) test(`session close error ${code} does not block the next session`, async () => {
+  let sessions = 0
+  const h = harness({
+    sessionCapabilities: { close: {} },
+    newSession: () => ({ sessionId: 's' + ++sessions }),
+    run: (_, __, method) => { assert.equal(method, 'session/close'); throw new RequestError(code) },
+  })
+  const signal = new AbortController().signal
+  for (let i = 0; i < 3; i++) await h.connection.newSession(process.cwd(), undefined, signal)
+  assert.equal(h.connection.sessionId, 's3')
+  assert.equal(h.calls.filter(({ method }) => method === 'session/close').length, code === -32601 ? 1 : 2)
+  await h.connection.close()
 })
 
 test('external permissions select only an advertised mode and require confirmation', async () => {
@@ -151,12 +186,12 @@ test('released bridge performs DSH skill and existing MCP calls without replayin
   const executions = [], events = [{ type: 'step/start', data: { turn: 0, step: 0 } }, { type: 'user/message', data: { id: 'm', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'use DSH' }] } }]
   const session = { id: 's', get seq() { return events.length }, header: { cwd: process.cwd() }, surface: { nodes: [1] }, eventAt: (seq) => events[seq], deriveEventMessage: (e) => e.data, append(type, data) { events.push({ type, data }); return { seq: events.length - 1 } } }
   const agent = { session }, schemas = ['skill', 'mcp__existing__query'].map((name) => ({ name, parameters: { type: 'object' } }))
-  const h = harness({ run: async () => {
+  const h = harness({ run: async (handlers, params) => {
     for (const [id, name] of ['skill', 'mcp__existing__query'].entries()) {
       const result = await gateway.call(gateway.active, name, {}, id, new AbortController().signal)
       assert.equal(result.isError, undefined)
     }
-    return { stopReason: 'end_turn' }
+    return textReply(handlers, params)
   } })
   const ctx = { get() {}, subprocess: h.subprocess, agents: { currentInitiator: () => agent, withInitiator: (_, fn) => fn() }, sessions: { flush: async () => true }, tools: {
     resolve: async () => ({ view: (scope) => scope === agent ? new Map(schemas.map((s) => [s.name, s])) : new Map(), dispose() {} }),
@@ -170,6 +205,7 @@ test('released bridge performs DSH skill and existing MCP calls without replayin
     assert.equal(events.filter((e) => e.type === 'assistant/message').length, 2)
     assert.equal(chunks.some((c) => c.blockType === 'tool-call'), false)
     assert.equal(chunks.at(-1).type, 'finish')
+    assert.equal(chunks.at(-1).reason.kind, 'stop')
   } finally { Gateway.prototype.listen = oldListen }
 })
 
@@ -211,16 +247,50 @@ test('a pooled session-start failure still closes the per-turn MCP gateway exact
   const listen = Gateway.prototype.listen, close = Gateway.prototype.close
   let closes = 0
   Gateway.prototype.listen = async () => ({ name: 'dsh', type: 'http', url: 'http://127.0.0.1/fake', headers: [] })
-  Gateway.prototype.close = async () => { closes++ }
+  Gateway.prototype.close = async () => { closes++; throw new Error('private cleanup details') }
   const events = [{ type: 'step/start', data: { turn: 0, step: 0 } }, { type: 'user/message', data: { id: 'm', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] } }]
   const session = { id: 's', seq: 2, header: { cwd: process.cwd() }, surface: { nodes: [1] }, eventAt: (seq) => events[seq], deriveEventMessage: (e) => e.data }
   const ctx = { get() {}, agents: { currentInitiator: () => ({ session }) }, sessions: { flush: async () => true }, tools: {
-    resolve: async () => ({ view: () => new Map(), dispose() {} }), definitions: () => [], selectExecutor: () => ({ describe: () => ({ schemas: [] }) }),
+    resolve: async () => ({ view: () => new Map(), dispose() {} }), definitions: () => [{ name: 'read' }], selectExecutor: () => ({ describe: () => ({ schemas: [{ name: 'read', parameters: {} }] }) }),
   } }
   try {
-    await assert.rejects(async () => {
-      for await (const chunk of streamReleasedTurn(ctx, { toolSource: 'dsh', tools: [], maxBindings: 1, maxContextBytes: 10000 }, { id: 'test' }, { provider: 'acp-test', sessionId: 's', model: '@default' }, new AbortController().signal, new Set(), new Set(), undefined, { use: async () => { throw new Error('session auth failed') } })) {}
-    }, /session auth failed/)
+    const chunks = await Array.fromAsync(streamReleasedTurn(ctx, { toolSource: 'dsh', tools: [], maxBindings: 1, maxContextBytes: 10000 }, { id: 'test' }, { provider: 'acp-test', sessionId: 's', model: '@default' }, new AbortController().signal, new Set(), new Set(), undefined, { use: async () => { throw new Error('private session details') } }))
+    assert.equal(chunks.at(-1).reason.kind, 'error')
+    assert.match(chunks.at(-1).reason.failure.message, /session\/new/)
+    assert.doesNotMatch(chunks.at(-1).reason.failure.message, /private/)
     assert.equal(closes, 1)
   } finally { Gateway.prototype.listen = listen; Gateway.prototype.close = close }
+})
+
+test('released turn without DSH tools can use an ACP agent without HTTP MCP', async () => {
+  const h = harness()
+  let sentPrompt
+  const connection = {
+    models: [], imageInput: false,
+    async selectModel() {},
+    async prompt(prompt, { onText }) { sentPrompt = prompt; onText('OK'); return 'end_turn' },
+  }
+  const message = { id: 'm', source: { kind: 'user' }, role: 'user', content: [{ type: 'text', text: 'hello' }] }
+  const session = { id: 's', seq: 1, header: { cwd: process.cwd() }, surface: { nodes: [0] }, eventAt: () => ({ type: 'user/message', data: message }), deriveEventMessage: (e) => e.data }
+  const ctx = {
+    get() {}, agents: { currentInitiator: () => ({ session }) }, sessions: { flush: async () => true },
+    tools: { resolve: async () => ({ view: () => new Map(), dispose() {} }), definitions: () => [], selectExecutor: () => ({ describe: () => ({ schemas: [] }) }) },
+  }
+  const connections = { async use(_command, { mcp, signal }, task) { assert.equal(mcp, undefined); return task(connection, signal) } }
+  const chunks = await Array.fromAsync(streamReleasedTurn(ctx, { toolSource: 'dsh', tools: [], maxBindings: 1, maxContextBytes: 10000, maxOutputBytes: 1000 }, h.command, { provider: 'acp-fake', sessionId: 's', model: '@default' }, new AbortController().signal, new Set(), new Set(), undefined, connections))
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+  assert.doesNotMatch(sentPrompt[0].text, /dsh MCP/)
+  await h.connection.close()
+})
+
+test('released turn reports an empty response without marking the model as verified', async () => {
+  const h = harness()
+  const message = { id: 'm', source: { kind: 'user' }, role: 'user', content: [{ type: 'text', text: 'hello' }] }
+  const session = { id: 's', seq: 1, header: { cwd: process.cwd() }, surface: { nodes: [0] }, eventAt: () => ({ type: 'user/message', data: message }), deriveEventMessage: (e) => e.data }
+  const ctx = { get() {}, subprocess: h.subprocess, agents: { currentInitiator: () => ({ session }) }, sessions: { flush: async () => true } }
+  const outcomes = []
+  const chunks = await Array.fromAsync(streamReleasedTurn(ctx, { toolSource: 'external', maxBindings: 1, maxContextBytes: 10000, cancelGraceMs: 10 }, h.command, { provider: 'acp-fake', sessionId: 's', model: '@default' }, new AbortController().signal, new Set(), new Set(), (event) => outcomes.push(event)))
+  assert.equal(chunks.at(-1).reason.failure.code, 'EMPTY_RESPONSE')
+  assert.equal(outcomes.at(-1).error.code, 'EMPTY_RESPONSE')
+  await h.connection.close()
 })

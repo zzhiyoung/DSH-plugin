@@ -22,7 +22,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 - 输入框旁常驻“ACP 连接”入口，查看各智能体状态、刷新并恢复登录；新会话未选择模型时也可用。
 - 一个智能体一个模型组，模型列表实时来自该 CLI 当前账号（`@default` 为智能体默认模型）。
 - 流式正文；ACP `agent_thought_chunk` 映射为 DSH 的思考块，可在界面里展开查看（`showThoughts` 可关闭）。
-- 默认 `released` 复用进程登录态，每轮发送 DSH 可见历史到独立 ACP 会话；实验 `driver` 复用会话并发送增量。
+- 默认 `released` 复用进程登录态，每轮向独立 ACP 会话发送本轮请求和预算允许的最近历史。实验 `driver` 复用会话并发送增量。
 - 两种接入方式：
   - `released`（默认）：走公开的 `llm/stream`，在官方桌面版内也能桥接现有 DSH 工具、MCP 和技能；
   - `driver`：供实现了 `agentTurnDriver` 的宿主实验使用。工具桥接要求外部智能体声明 HTTP MCP。
@@ -30,7 +30,7 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 
 ## 安装
 
-当前版本 **0.8.3**，支持 Windows 官方 DeepSeek Harness Desktop；已核对 **0.2.2-rc.3** 的宿主接口。0.7.0 起不按 DSH 版本号停用插件：版本声明放开，启动时检查必要接口，缺失时明确报错。未来宿主若更改接口语义，仍可能需要适配；结构自检不等同于完整对话验收。
+当前版本 **0.8.5**，支持 Windows 官方 DeepSeek Harness Desktop。启动时检查宿主接口，缺失时报告具体服务或方法。桌面端完整任务验收需使用实际 CLI 和账号。
 
 1. 在 DSH 桌面版打开「插件」→「添加插件」。
 2. 「包名或地址」填本仓库目录的完整路径（例如 `D:\coding\DSH-plugin`），或先 `npm run pack:tgz` 生成 `.tgz` 后填该文件的完整路径。
@@ -97,17 +97,19 @@ DSH 通过 `LlmAdapter` 发现模型提供方。本插件为每个配置好的 A
 | `loginMs` | `180000` | 手动刷新触发登录时的等待上限（毫秒）；登录与目录/模型验证分别计时 |
 | `discoveryMs` | `60000` | 握手、建会话及手动模型验证各阶段的等待预算；交互登录单独使用 `loginMs`，不限制普通对话任务 |
 | `discoveryWaitMs` | `800` | 模型菜单首次等候预算；到时先返回已加载目录或默认入口，后台完成后通知 DSH 刷新 |
-| `startupMs` | `0` | 握手/建会话不限时；正数为显式启动截止毫秒 |
+| `startupMs` | `60000` | 获得连接使用权后，握手、建会话、模型和权限选择共用的毫秒预算。`0` 表示启动阶段不限时 |
 | `maxImageBytes` | `20971520` | 单轮图片总字节上限，独立于文字上限 |
 | `cancelGraceMs` | `5000` | 取消与进程退出宽限 |
 | `idleMs` | `900000` | 实验 `driver` 的空闲会话绑定回收时间；`released` 按提供方保留进程至退出、故障或取消清理 |
 | `maxBindings` | `8` | `driver` 的会话绑定上限；`released` 的并发对话请求上限，后台目录检查不占用此名额 |
-| `maxContextBytes` | `131072` | 单次发送上下文上限 |
+| `maxContextBytes` | `131072` | 文字上下文 UTF-8 字节上限。本轮输入与工具指引优先，剩余预算用于最近历史。`0` 表示取消插件文字上限 |
 | `maxOutputBytes` | `262144` | 单轮输出上限 |
 
 模型目录发现与普通对话采用不同预算：连接阶段默认 60 秒，菜单首次最多等待 800 毫秒；成功目录缓存 5 分钟，失败冷却 30 秒，刷新失败保留旧目录。输入框旁的“ACP 连接”显示各提供方状态和独立刷新按钮；原模型菜单根层面板也保留。手动刷新绕过失败冷却，重复点击合并。首次 AUTH 失败显示“需要登录”，其他探测失败显示“检测失败”。后台检查不发模型请求；手动刷新会发送最小 OK 验证请求，可能产生模型用量。同一 agent 的刷新与对话串行，其他 agent 独立。
 
 单轮不设截止时间，旧 `promptMs` 忽略。用户停止、插件卸载、CLI/宿主自身限制及输出字节超限仍会结束任务。取消宽限与空闲回收不限制执行中的轮次。
+
+标准模式在发送提示前发现复用进程断开时，可重建一次连接。提示提交后，由会话记录和对应阶段的错误帮助判断执行结果。文本上下文裁剪只作用于传给 CLI 的内容，旧图片缺失或超过图片预算时可继续对话。本轮图片需完整读取，并通过与 CLI 的能力检查。
 
 ### 在插件中选择工具与审批
 
@@ -138,7 +140,7 @@ DSH 使用 PTC 时，桥接入口是 run_code，提供相同作用域的工具 S
 - 仅用于 **根会话**：子智能体、标题生成等带 `purpose` 的请求不会走 ACP 路由。
 - DSH 工具调用记录和结果保存在 DSH 会话，结果发给外部智能体；CLI 原生工具的完整执行过程尚未映射成 DSH 工具记录。
 - 图片通过 DSH 附件库读取并发送 ACP image 块，按 agent 握手能力声明图片输入；具体模型仍需实测。通用文件附件暂不支持。
-- 外部智能体必须支持 HTTP MCP 才能使用 DSH 工具桥接；未声明支持时明确报错，可在设置中切换为 external。DSH 工具来源是“优先使用”，ACP 没有统一禁用 CLI 所有原生工具的开关。
+- 当前会话有可桥接的 DSH 工具时，外部智能体必须支持 HTTP MCP，可在设置中选用 `external`。没有可桥接工具时可直接连接不支持 HTTP MCP 的智能体。收到并行工具请求时，桥接按收到顺序执行并沿用 DSH 审批规则。
 - ACP 原生工具审批逐次转交 DSH，只把 allowed-once 映射为一次允许；拒绝、取消或审批服务缺失均不放行。CLI 未上报审批的操作无法接管。外部执行不受 DSH 沙箱自动约束。
 - 自动识别的 WorkBuddy 精简与完整 CLI 均使用 `--serve ... --port 0`，会在 `127.0.0.1` 随机端口起本地 HTTP 服务。启动横幅不表示 ACP 已连通，应以握手、建会话及模型验证结果判断。完整版普通 `--acp` 的固定端口可能与桌面端冲突；连接回收时服务随之退出。
 - 默认 released 为每个 agent 保留一个进程，同一 agent 的刷新与对话串行，不同 agent 独立。WorkBuddy 登录可能与桌面登录冲突，不能保证两端共存；手动刷新时才允许发起一次认证。
@@ -181,7 +183,7 @@ WorkBuddy 会把模型服务错误放在 refusal 的 _meta 中，插件会分类
 
 ### 使用官方完整版 CLI（0.8.2）
 
-`npm install -g @tencent-ai/codebuddy-code` 装出的独立 CLI 带 `dist/codebuddy-headless.js`。把 `DSH_ACP_WORKBUDDY` 指向它的 `bin/codebuddy`，插件会识别为完整版，不注入 lite bundle 或内存凭据变量，统一使用 `--serve --acp --acp-transport stdio --port 0`。安装当前 0.8.3 插件并完全重启 DSH 后，可点“ACP 连接 → WorkBuddy → 刷新”完成一次登录验证，也可先在终端运行 `codebuddy` 后执行 `/login`。登录方式有 iOA、external、internal、selfhosted；账号权益与桌面登录未必相同。
+`npm install -g @tencent-ai/codebuddy-code` 装出的独立 CLI 带 `dist/codebuddy-headless.js`。把 `DSH_ACP_WORKBUDDY` 指向它的 `bin/codebuddy`，插件会识别为完整版并使用 `--serve --acp --acp-transport stdio --port 0`。安装插件并完全重启 DSH 后，可点“ACP 连接 → WorkBuddy → 刷新”完成一次登录验证，也可先在终端运行 `codebuddy` 后执行 `/login`。登录方式有 iOA、external、internal、selfhosted；账号权益与桌面登录未必相同。
 
 完整版仍与桌面共用 `~/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info` 和目录 watcher，authenticate 依旧先 logout 再 login，换完整版不等于解决两端互踢。若实测仍冲突，在该 agent 的 `env` 加 `CODEBUDDY_CREDENTIALS_IN_MEMORY=1` 可让 CLI 只用内存登录（代价是 DSH 重启后需再登录一次）。服务端是否允许同一账号两端同时在线，仍未实测。
 

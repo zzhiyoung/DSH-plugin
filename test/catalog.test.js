@@ -105,7 +105,7 @@ test('background discovery skips authentication and bounds session creation', as
   const ctx = { on() {}, get() {}, effect(fn) { disposed = fn() }, logger: { warn: (s) => warnings.push(s) }, llm: { registerAdapter: (_, value) => { catalog = value } }, subprocess: { spawn() { spawns++; return { stdin: new PassThrough(), stdout: new PassThrough(), done: new Promise(() => {}), terminate() { killed++ }, waitForExit: async () => true } } } }
   ctx.sessions = { flush: async () => true }
   try {
-    apply(ctx, { agents: [{ id: 'slow', title: 'Slow', command: 'fake', args: [], env: [], auth: 'internal' }], execution: 'released', tools: [], startupMs: 0, discoveryMs: 20, discoveryWaitMs: 2, cancelGraceMs: 10, maxContextBytes: 4096, maxBindings: 8 })
+    apply(ctx, { agents: [{ id: 'slow', title: 'Slow', command: 'fake', args: [], env: [], auth: 'internal' }], execution: 'released', tools: [], startupMs: 0, discoveryMs: 250, discoveryWaitMs: 2, cancelGraceMs: 10, maxContextBytes: 4096, maxBindings: 8 })
     assert.equal((await catalog.listModels('acp-slow'))[0].id, '@default')
     await catalog.cache.get('acp-slow').pending
     assert.equal(killed, 1)

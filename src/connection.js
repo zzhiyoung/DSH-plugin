@@ -35,6 +35,7 @@ export function commandEnvironment(entries) {
 }
 /** Live connection and one ACP Session. Its owner retires it after any uncertain prompt. */
 export class AcpConnection {
+	#transport = new AbortController();
 	cancelGraceMs;
 	mcpTools;
 	connection;
@@ -74,11 +75,10 @@ export class AcpConnection {
 				stderr: { maxBytes: 8192 }
 			}
 		});
-		this.child.done.then(() => {
-			this.closed = true;
-		}, () => {
-			this.closed = true;
-		});
+		this.child.done.then(
+			() => this.#disconnect('ACP subprocess exited.'),
+			() => this.#disconnect('ACP subprocess failed.'),
+		);
 		const { stdin, stdout } = this.child;
 		if (stdin === void 0 || stdout === void 0) {
 			this.child.terminate();
@@ -89,8 +89,9 @@ export class AcpConnection {
 			for (const byte of chunk) {
 				lineBytes = byte === 10 ? 0 : lineBytes + 1;
 				if (lineBytes > 1024 * 1024) {
+					controller.error(new Error('ACP response line exceeds 1 MiB.'));
+					this.#disconnect('ACP response line exceeds 1 MiB.');
 					this.child.terminate();
-					controller.error(/* @__PURE__ */ new Error("ACP response line exceeds 1 MiB."));
 					return;
 				}
 			}
@@ -128,7 +129,8 @@ export class AcpConnection {
 				let outcome;
 				try { outcome = await until(() => ask(params, signal), signal); }
 				catch { outcome = 'unavailable'; }
-				if (outcome === 'allowed-once' && this.promptSignal === signal && !signal.aborted) {
+				if (this.promptSignal !== signal || signal.aborted) return { outcome: { outcome: 'cancelled' } };
+				if (outcome === 'allowed-once') {
 					const allow = params.options.find((option) => option.kind === 'allow_once');
 					if (allow) return { outcome: { outcome: 'selected', optionId: allow.optionId } };
 				}
@@ -139,12 +141,30 @@ export class AcpConnection {
 				optionId: reject.optionId
 			} });
 		}).connect(ndJsonStream(Writable.toWeb(stdin), input));
-		this.connection.closed.then(() => {
-			this.closed = true;
-		});
+		const onTransportClosed = () => this.#disconnect('ACP protocol stream closed.');
+		if (this.connection.signal) {
+			this.connection.signal.addEventListener('abort', onTransportClosed, { once: true });
+			if (this.connection.signal.aborted) onTransportClosed();
+		} else {
+			this.connection.closed.then(onTransportClosed, onTransportClosed);
+		}
 	}
 	get available() {
 		return !this.closed;
+	}
+	#disconnect(message) {
+		if (this.closed) return;
+		this.closed = true;
+		const error = Object.assign(new Error(message), { code: 'ACP_TRANSPORT', acpStage: this.stage });
+		this.#transport.abort(error);
+		this.connection?.close(error);
+	}
+	#whileConnected(start, signal) {
+		return until(start, AbortSignal.any([signal, this.#transport.signal]));
+	}
+	#request(method, params, signal) {
+		this.stage = method;
+		return this.#whileConnected(() => this.connection.agent.request(method, params), signal);
 	}
 	/**
 	* Deliver one streamed fragment to its sink, remembering a consumer failure.
@@ -157,17 +177,17 @@ export class AcpConnection {
 			sink(text);
 		} catch (error) {
 			this.outputError = error;
+			this.#disconnect('ACP output could not be delivered.');
 			this.child.terminate();
 		}
 	}
 	/** Initialize once; interactive login is a separate, explicitly requested operation. */
 	async initialize(signal) {
 		if (this.initialized) return;
-		this.stage = 'initialize';
-		const result = await until(() => this.connection.agent.request(methods.agent.initialize, {
+		const result = await this.#request(methods.agent.initialize, {
 			protocolVersion: PROTOCOL_VERSION, clientCapabilities: {},
-			clientInfo: { name: 'dsh-agent-hub', title: 'DSH Agent Hub', version: '0.8.3' },
-		}), signal);
+			clientInfo: { name: 'dsh-agent-hub', title: 'DSH Agent Hub', version: '0.8.5' },
+		}, signal);
 		if (result.protocolVersion !== PROTOCOL_VERSION) throw new Error('Unsupported ACP protocol version.');
 		this.imageInput = result.agentCapabilities?.promptCapabilities?.image === true;
 		this.httpMcp = result.agentCapabilities?.mcpCapabilities?.http === true;
@@ -181,8 +201,7 @@ export class AcpConnection {
 		method ??= ['internal', 'qodercli-login', 'qoderclicn-login', 'chat-gpt'].find((id) => available.includes(id));
 		if (!method && available.length === 1) method = available[0];
 		if (!method || (available.length && !available.includes(method))) throw promptFailure({ errorMessage: { code: -32000 } }, this.title);
-		this.stage = 'authenticate';
-		try { await until(() => this.connection.agent.request(methods.agent.authenticate, { methodId: method }), signal); }
+		try { await this.#request(methods.agent.authenticate, { methodId: method }, signal); }
 		catch (error) {
 			if (error instanceof RequestError) throw promptFailure({ errorMessage: { code: error.code, message: error.message, data: error.data } }, this.title);
 			throw error;
@@ -191,16 +210,21 @@ export class AcpConnection {
 	/** A new ACP session for each DSH request avoids sharing another conversation's history. */
 	async newSession(cwd, mcp, signal) {
 		await this.initialize(signal);
+		this.stage = 'session/new';
 		if (mcp !== undefined && !this.httpMcp) throw new Error('This ACP agent does not advertise HTTP MCP.');
 		try {
 			if (this.sessionId && this.sessionCapabilities.close) {
-				this.stage = 'session/close';
-				await until(() => this.connection.agent.request('session/close', { sessionId: this.sessionId }), signal);
+				try {
+					await this.#request('session/close', { sessionId: this.sessionId }, signal);
+				} catch (error) {
+					if (!(error instanceof RequestError) || ![-32002, -32601].includes(error.code)) throw error;
+					// Some agents advertise the method before implementing it. Do not probe it again.
+					if (error.code === -32601) this.sessionCapabilities = { ...this.sessionCapabilities, close: undefined };
+				}
 			}
 			this.sessionId = undefined;
 			this.model = undefined;
-			this.stage = 'session/new';
-			const session = await until(() => this.connection.agent.request(methods.agent.session.new, { cwd, mcpServers: mcp === undefined ? [] : [mcp] }), signal);
+			const session = await this.#request(methods.agent.session.new, { cwd, mcpServers: mcp === undefined ? [] : [mcp] }, signal);
 			if (typeof session.sessionId !== 'string' || !session.sessionId) throw new Error('ACP returned an empty session id.');
 			this.sessionId = session.sessionId;
 			this.mcpName = mcp?.name;
@@ -231,14 +255,15 @@ export class AcpConnection {
 		const value = requested ?? this.initialModel;
 		const model = this.model;
 		if (value === void 0 || model?.currentValue === value) return;
+		this.stage = methods.agent.session.setConfigOption;
 		if (model === void 0 || !this.models.some((option) => option.value === value)) throw new Error("The ACP agent no longer offers the selected model. Choose a model from its current list.");
 		const sessionId = this.sessionId;
 		if (sessionId === void 0) throw new Error("ACP session is unavailable.");
-		const response = await until(() => this.connection.agent.request(methods.agent.session.setConfigOption, {
+		const response = await this.#request(methods.agent.session.setConfigOption, {
 			sessionId,
 			configId: model.id,
 			value
-		}), signal);
+		}, signal);
 		this.model = modelConfig(response.configOptions);
 		if (this.model?.currentValue !== value) throw new Error("The ACP agent did not confirm the selected model.");
 	}
@@ -248,15 +273,17 @@ export class AcpConnection {
 		const option = this.permissionConfig;
 		if (option) {
 			if (option.currentValue === value) return;
+			this.stage = methods.agent.session.setConfigOption;
 			const choices = option.options.flatMap((o) => o.options ?? [o]);
 			if (!choices.some((o) => o.value === value)) throw new Error(`ACP permission mode ${value} is unavailable; available: ${choices.map((o) => o.value).join(', ')}`);
-			const response = await until(() => this.connection.agent.request(methods.agent.session.setConfigOption, { sessionId: this.sessionId, configId: option.id, value }), signal);
+			const response = await this.#request(methods.agent.session.setConfigOption, { sessionId: this.sessionId, configId: option.id, value }, signal);
 			this.permissionConfig = response.configOptions?.find((o) => o.id === option.id);
 			if (this.permissionConfig?.currentValue !== value) throw new Error('ACP agent did not confirm the permission mode.');
 			return;
 		}
+		this.stage = methods.agent.session.setMode;
 		if (!this.modes?.availableModes?.some((m) => m.id === value)) throw new Error(`This ACP agent does not advertise permission mode ${value}.`);
-		await until(() => this.connection.agent.request(methods.agent.session.setMode, { sessionId: this.sessionId, modeId: value }), signal);
+		await this.#request(methods.agent.session.setMode, { sessionId: this.sessionId, modeId: value }, signal);
 	}
 
 	/**
@@ -265,33 +292,35 @@ export class AcpConnection {
 	* @param handlers - streamed text and reasoning sinks plus the owning abort signal.
 	*/
 	async prompt(text, { onText, onThought, onPermission, signal }) {
+		this.stage = 'session/prompt';
 		const sessionId = this.sessionId;
+		this.#transport.signal.throwIfAborted();
 		if (sessionId === void 0 || this.closed) throw new Error("ACP session is unavailable.");
 		signal.throwIfAborted();
 		const agent = this.connection.agent;
 		const prompt = typeof text === 'string' ? [{ type: 'text', text }] : text;
 		if (prompt.some((block) => block.type === 'image') && !this.imageInput) throw new Error('This ACP agent does not advertise image prompt support.');
+		const promptSignal = AbortSignal.any([signal, this.#transport.signal]);
 		this.permission = onPermission;
-		this.promptSignal = signal;
+		this.promptSignal = promptSignal;
 		this.output = onText;
 		this.thought = onThought;
 		this.outputError = void 0;
-		this.stage = 'session/prompt';
-		const pending = agent.request(methods.agent.session.prompt, {
-			sessionId,
-			prompt
-		});
+		let pending;
 		try {
-			const result = await until(() => pending, signal);
+			const result = await until(() => {
+				pending = agent.request(methods.agent.session.prompt, { sessionId, prompt });
+				return pending;
+			}, promptSignal);
 			if (this.outputError !== void 0) throw this.outputError;
 			const failure = promptFailure(result, this.title);
 			if (failure) throw failure;
 			return result.stopReason;
 		} catch (error) {
-			if (signal.aborted && !this.closed) {
+			if (signal.aborted && pending && !this.closed) {
 				agent.notify(methods.agent.session.cancel, { sessionId }).catch((_error) => {});
 				try {
-					await until(() => pending, AbortSignal.timeout(this.cancelGraceMs));
+					await this.#whileConnected(() => pending, AbortSignal.timeout(this.cancelGraceMs));
 				} catch (_error) {}
 			}
 			if (this.outputError !== void 0) throw this.outputError;
@@ -308,10 +337,11 @@ export class AcpConnection {
 	/** Wait for the managed range, including children, to exit within the configured grace. */
 	close() {
 		return this.closeWork ??= (async () => {
-			this.closed = true;
+			this.#disconnect('ACP connection closed.');
 			this.child.terminate();
-			this.connection.close();
-			if (!await this.child.waitForExit(AbortSignal.timeout(this.cancelGraceMs * 2))) throw new Error("ACP process range did not exit before the cleanup deadline.");
+			const deadline = AbortSignal.timeout(this.cancelGraceMs * 2);
+			const exited = await until(() => this.child.waitForExit(deadline), deadline);
+			if (!exited) throw new Error("ACP process range did not exit before the cleanup deadline.");
 		})();
 	}
 }

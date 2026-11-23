@@ -2,16 +2,18 @@ import assert from 'node:assert/strict'
 import { register } from 'node:module'
 import { PassThrough } from 'node:stream'
 import { test } from 'node:test'
+import { setImmediate as tick, setTimeout as delay } from 'node:timers/promises'
 register(new URL('./support/hooks.mjs', import.meta.url).href)
 const { setClientFactory, RequestError } = await import('@agentclientprotocol/sdk')
 const { AgentConnections } = await import('../src/agent-connections.js')
 const { Catalog } = await import('../src/catalog.js')
 const { streamReleasedTurn } = await import('../src/released.js')
 
-function fixture(t, { loggedIn = false, loginWorks = true, failAtSession = false, loginGate, backendError } = {}) {
-  const calls = [], phases = [], shutdown = new AbortController()
+function fixture(t, { loggedIn = false, loginWorks = true, failAtSession = false, loginGate, backendError, beforeSession, startupMs, waitForExit = true } = {}) {
+  const calls = [], phases = [], children = [], shutdown = new AbortController()
   let spawns = 0, killed = 0
   setClientFactory(() => {
+    const processNumber = spawns, childExit = children.at(-1)
     let authenticated = loggedIn, update, sessionId, sessionCount = 0
     return {
       onNotification(_, fn) { update = fn; return this }, onRequest() { return this },
@@ -20,6 +22,7 @@ function fixture(t, { loggedIn = false, loginWorks = true, failAtSession = false
         if (method === 'initialize') return { protocolVersion: 1, authMethods: [{ id: 'internal' }] }
         if (method === 'authenticate') { await loginGate; authenticated = loginWorks; return {} }
         if (method === 'session/new') {
+          await beforeSession?.({ processNumber, completedSessions: sessionCount, childExit })
           if (failAtSession && !authenticated) throw new RequestError(-32000)
           sessionId = 'session-' + ++sessionCount
           return { sessionId }
@@ -32,8 +35,13 @@ function fixture(t, { loggedIn = false, loginWorks = true, failAtSession = false
       }, notify: async () => {} } } },
     }
   })
-  const ctx = { subprocess: { spawn() { spawns++; return { stdin: new PassThrough(), stdout: new PassThrough(), done: new Promise(() => {}), terminate() { killed++ }, waitForExit: async () => true } } } }
-  const config = { discoveryMs: 1000, loginMs: 1000, cancelGraceMs: 10 }
+  const ctx = { subprocess: { spawn() {
+    spawns++
+    const childExit = Promise.withResolvers()
+    children.push(childExit)
+    return { stdin: new PassThrough(), stdout: new PassThrough(), done: childExit.promise, terminate() { killed++ }, waitForExit: async () => waitForExit }
+  } } }
+  const config = { discoveryMs: 1000, loginMs: 1000, cancelGraceMs: 10, startupMs }
   const pool = new AgentConnections(ctx, config, shutdown.signal, (_, phase) => phases.push(phase))
   const command = { id: 'workbuddy', title: 'WorkBuddy', command: 'fake', args: [], env: [], auth: 'internal', authMode: 'existing' }
   t.after(async () => { shutdown.abort(); await pool.close(); setClientFactory(undefined) })
@@ -138,4 +146,68 @@ test('a real released turn reuses process-local login but creates a fresh worksp
   assert.equal(f.calls.filter((c) => c.method === 'session/new').at(-1).params.cwd, process.cwd())
   const prompts = f.calls.filter((c) => c.method === 'session/prompt')
   assert.notEqual(prompts.at(-1).params.sessionId, prompts.at(-2).params.sessionId)
+})
+
+test('a queued conversation gets its full setup deadline after taking the lease', async (t) => {
+  const f = fixture(t, { startupMs: 150 })
+  const entered = Promise.withResolvers(), release = Promise.withResolvers()
+  const options = { cwd: process.cwd(), mcpTools: new Set(), signal: new AbortController().signal }
+  const first = f.pool.use(f.command, options, async (_, startup) => { entered.resolve(startup); await release.promise })
+  const firstStartup = await entered.promise
+  const second = f.pool.use(f.command, options, (_, startup) => startup.aborted)
+  await delay(170)
+  assert.equal(firstStartup.aborted, true)
+  release.resolve()
+  await first
+  assert.equal(await second, false)
+  assert.equal(f.spawns, 1)
+})
+
+test('an expired session-start RPC discards the connection and retains its phase when cleanup fails', async (t) => {
+  const f = fixture(t, {
+    startupMs: 50, waitForExit: false,
+    beforeSession: () => new Promise(() => {}),
+  })
+  const options = { cwd: process.cwd(), mcpTools: new Set(), signal: new AbortController().signal }
+  const attempt = () => f.pool.use(f.command, options, () => assert.fail('should not start a user prompt'))
+  const isTimeout = (error) => error.name === 'TimeoutError' && error.acpStage === 'session/new' && /session\/new/.test(error.message)
+  await Promise.all([assert.rejects(attempt(), isTimeout), delay(70)])
+  await Promise.all([assert.rejects(attempt(), isTimeout), delay(70)])
+  assert.equal(f.spawns, 2)
+  assert.equal(f.killed, 2)
+})
+
+test('a stale retained process is replaced once before a prompt starts', async (t) => {
+  const f = fixture(t, { beforeSession: ({ processNumber, completedSessions, childExit }) => {
+    if (processNumber !== 1 || completedSessions === 0) return
+    childExit.resolve()
+    return new Promise(() => {})
+  } })
+  await f.pool.inspect(f.command)
+  const options = { cwd: process.cwd(), mcpTools: new Set(), signal: new AbortController().signal }
+  let prompts = 0
+  await f.pool.use(f.command, options, () => { prompts++ })
+  assert.equal(prompts, 1)
+  assert.equal(f.spawns, 2)
+  assert.equal(f.killed, 1)
+})
+
+test('abort settles queued work immediately and keeps the active lease until cleanup', async (t) => {
+  const f = fixture(t)
+  const active = new AbortController(), queued = new AbortController()
+  const entered = Promise.withResolvers(), release = Promise.withResolvers()
+  const options = { cwd: process.cwd(), mcpTools: new Set(), signal: active.signal }
+  const first = f.pool.use(f.command, options, async () => { entered.resolve(); await release.promise; active.signal.throwIfAborted() })
+  let finished = false
+  const firstRejection = assert.rejects(first, /active abort/).then(() => { finished = true })
+  await entered.promise
+  const second = f.pool.use(f.command, { ...options, signal: queued.signal }, () => assert.fail('cancelled queued task started'))
+  queued.abort(new Error('queued abort'))
+  await assert.rejects(second, /queued abort/)
+  active.abort(new Error('active abort'))
+  await tick()
+  assert.equal(finished, false)
+  release.resolve()
+  await firstRejection
+  assert.equal(f.killed, 1)
 })
